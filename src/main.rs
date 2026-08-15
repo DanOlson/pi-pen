@@ -17,7 +17,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Build an environment image.
-    Build(EnvArg),
+    Build(BuildArgs),
     /// List or inspect discovered environments.
     Env {
         #[command(subcommand)]
@@ -35,6 +35,18 @@ struct EnvArg {
     env: Option<String>,
 }
 
+#[derive(Debug, Args)]
+struct BuildArgs {
+    /// Environment name or manifest path.
+    env: Option<String>,
+    /// Build even when the content-addressed image already exists locally.
+    #[arg(long)]
+    rebuild: bool,
+    /// Always check for a newer base image while building.
+    #[arg(long)]
+    pull: bool,
+}
+
 #[derive(Debug, Subcommand)]
 enum EnvCommand {
     /// List repo-local and user-library environments.
@@ -47,6 +59,12 @@ enum EnvCommand {
 struct RunArgs {
     /// Environment name or manifest path.
     env: Option<String>,
+    /// Build even when the content-addressed image already exists locally.
+    #[arg(long)]
+    rebuild: bool,
+    /// Always check for a newer base image while building.
+    #[arg(long)]
+    pull: bool,
     /// Arguments passed through to pi.
     #[arg(last = true)]
     pi_args: Vec<String>,
@@ -66,9 +84,21 @@ struct InitArgs {
     /// Docker base image.
     #[arg(long)]
     base_image: Option<String>,
+    /// Reusable parent environment to extend.
+    #[arg(long, conflicts_with = "base_image")]
+    extends: Option<String>,
+    /// Git user.name to seed in the container's persistent home.
+    #[arg(long)]
+    git_user_name: Option<String>,
+    /// Git user.email to seed in the container's persistent home.
+    #[arg(long)]
+    git_user_email: Option<String>,
     /// Disable the default Debian package baseline.
     #[arg(long)]
     no_default_packages: bool,
+    /// Composable stack preset. Use comma-separated values or repeat the flag.
+    #[arg(long = "with", value_delimiter = ',')]
+    presets: Vec<String>,
     /// Additional apt package. Can be repeated.
     #[arg(long = "package")]
     packages: Vec<String>,
@@ -81,7 +111,11 @@ impl From<Cli> for pi_sandbox::Cli {
     fn from(value: Cli) -> Self {
         Self {
             command: match value.command {
-                Command::Build(args) => pi_sandbox::Command::Build { env: args.env },
+                Command::Build(args) => pi_sandbox::Command::Build {
+                    env: args.env,
+                    rebuild: args.rebuild,
+                    pull: args.pull,
+                },
                 Command::Env { command } => pi_sandbox::Command::Env {
                     command: match command {
                         EnvCommand::List => pi_sandbox::EnvCommand::List,
@@ -93,12 +127,18 @@ impl From<Cli> for pi_sandbox::Cli {
                     force: args.force,
                     name: args.name,
                     base_image: args.base_image,
+                    extends: args.extends,
+                    git_user_name: args.git_user_name,
+                    git_user_email: args.git_user_email,
                     default_packages: Some(!args.no_default_packages),
+                    presets: args.presets,
                     packages: args.packages,
                     commands: args.commands,
                 }),
                 Command::Run(args) => pi_sandbox::Command::Run {
                     env: args.env,
+                    rebuild: args.rebuild,
+                    pull: args.pull,
                     pi_args: args.pi_args,
                 },
             },

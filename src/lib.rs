@@ -28,6 +28,21 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "python3-pip",
     "python3-venv",
 ];
+const RUST_PATH: &str =
+    "/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
+const RUST_INSTALL_COMMAND: &str =
+    "mkdir -p /opt/cargo /opt/rustup && chmod -R 0777 /opt/cargo /opt/rustup";
+const RUSTUP_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --profile minimal --no-modify-path";
+const RUST_COMPONENTS_COMMAND: &str = "CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/cargo/bin/rustup component add rustfmt clippy";
+const RUST_PERMISSIONS_COMMAND: &str = "chmod -R a+rX /opt/cargo /opt/rustup";
+const TAURI_PACKAGES: &[&str] = &[
+    "file",
+    "libssl-dev",
+    "libgtk-3-dev",
+    "libayatana-appindicator3-dev",
+    "librsvg2-dev",
+    "libwebkit2gtk-4.1-dev",
+];
 
 #[derive(Debug)]
 pub struct Cli {
@@ -39,6 +54,8 @@ pub struct Cli {
 pub enum Command {
     Build {
         env: Option<String>,
+        rebuild: bool,
+        pull: bool,
     },
     Env {
         command: EnvCommand,
@@ -46,6 +63,8 @@ pub enum Command {
     Init(InitOptions),
     Run {
         env: Option<String>,
+        rebuild: bool,
+        pull: bool,
         pi_args: Vec<String>,
     },
 }
@@ -62,7 +81,11 @@ pub struct InitOptions {
     pub force: bool,
     pub name: Option<String>,
     pub base_image: Option<String>,
+    pub extends: Option<String>,
+    pub git_user_name: Option<String>,
+    pub git_user_email: Option<String>,
     pub default_packages: Option<bool>,
+    pub presets: Vec<String>,
     pub packages: Vec<String>,
     pub commands: Vec<String>,
 }
@@ -87,6 +110,8 @@ pub struct EnvManifest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub extends: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub base_image: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub default_packages: Option<bool>,
@@ -97,12 +122,26 @@ pub struct EnvManifest {
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub env: BTreeMap<String, String>,
     #[serde(default)]
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub runtime_env: BTreeMap<String, String>,
+    #[serde(default)]
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub commands: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pi_install: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub git: Option<GitConfig>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<DockerfileHooks>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+#[serde(deny_unknown_fields)]
+pub struct GitConfig {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_name: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub user_email: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -120,37 +159,58 @@ pub struct DockerInvocation {
     pub args: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreparedImage {
+    tag: String,
+    dockerfile: String,
+}
+
+#[derive(Debug, Clone)]
+struct PreparedEnvironment {
+    images: Vec<PreparedImage>,
+    git: Option<GitConfig>,
+}
+
 pub fn run_cli(cli: Cli) -> Result<()> {
     match cli.command {
-        Command::Build { env } => {
+        Command::Build { env, rebuild, pull } => {
             let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
-            let dockerfile = render_dockerfile(&resolved.manifest);
             let cache = cache_dir()?;
-            let tag = image_tag(&resolved);
-            write_resolved_dockerfile(&cache, &tag, &dockerfile)?;
-            run_process(build_invocation(&cache, &tag)?)?;
+            let prepared = prepare_environment(&resolved, &cli.cwd)?;
+            build_images(&cache, &prepared.images, rebuild, pull)?;
         }
         Command::Env { command } => match command {
             EnvCommand::List => list_envs(&cli.cwd)?,
             EnvCommand::Show { env } => {
                 let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
-                println!("{}", render_dockerfile(&resolved.manifest));
+                let prepared = prepare_environment(&resolved, &cli.cwd)?;
+                show_images(&prepared.images);
             }
         },
         Command::Init(options) => {
             init_manifest_interactive(&cli.cwd, options)?;
         }
-        Command::Run { env, pi_args } => {
+        Command::Run {
+            env,
+            rebuild,
+            pull,
+            pi_args,
+        } => {
             let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
-            let dockerfile = render_dockerfile(&resolved.manifest);
             let cache = cache_dir()?;
-            let tag = image_tag(&resolved);
-            write_resolved_dockerfile(&cache, &tag, &dockerfile)?;
-            run_process(build_invocation(&cache, &tag)?)?;
+            let prepared = prepare_environment(&resolved, &cli.cwd)?;
+            build_images(&cache, &prepared.images, rebuild, pull)?;
+            let tag = &prepared
+                .images
+                .last()
+                .context("resolved environment did not produce an image")?
+                .tag;
 
             let uid = command_output("id", &["-u"])?;
             let gid = command_output("id", &["-g"])?;
-            run_process_interactive(run_invocation(&cli.cwd, &tag, &uid, &gid, &pi_args))?;
+            let home = persistent_home_dir(&cli.cwd, &resolved)?;
+            seed_git_config(&home, prepared.git.as_ref())?;
+            run_process_interactive(run_invocation(&cli.cwd, &home, tag, &uid, &gid, &pi_args))?;
         }
     }
 
@@ -159,7 +219,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
 
 pub fn init_manifest_interactive(cwd: &Path, options: InitOptions) -> Result<PathBuf> {
     let manifest = if options.yes {
-        init_manifest_from_options(cwd, &options)
+        init_manifest_from_options(cwd, &options)?
     } else {
         prompt_for_manifest(cwd, &options)?
     };
@@ -170,8 +230,8 @@ pub fn init_manifest_interactive(cwd: &Path, options: InitOptions) -> Result<Pat
     Ok(path)
 }
 
-pub fn init_manifest_from_options(cwd: &Path, options: &InitOptions) -> EnvManifest {
-    EnvManifest {
+pub fn init_manifest_from_options(cwd: &Path, options: &InitOptions) -> Result<EnvManifest> {
+    let mut manifest = EnvManifest {
         name: Some(
             options
                 .name
@@ -183,14 +243,20 @@ pub fn init_manifest_from_options(cwd: &Path, options: &InitOptions) -> EnvManif
                 .base_image
                 .clone()
                 .unwrap_or_else(|| DEFAULT_BASE_IMAGE.to_string()),
-        ),
+        )
+        .filter(|_| options.extends.is_none()),
+        extends: options.extends.clone(),
         default_packages: options
             .default_packages
             .and_then(|enabled| (!enabled).then_some(false)),
-        packages: options.packages.clone(),
-        commands: options.commands.clone(),
         ..EnvManifest::default()
-    }
+    };
+
+    apply_presets(&mut manifest, &options.presets)?;
+    extend_unique(&mut manifest.packages, options.packages.clone());
+    extend_unique(&mut manifest.commands, options.commands.clone());
+    manifest.git = git_config_from_options(options);
+    Ok(manifest)
 }
 
 pub fn write_project_manifest(cwd: &Path, manifest: &EnvManifest, force: bool) -> Result<PathBuf> {
@@ -216,34 +282,151 @@ fn prompt_for_manifest(cwd: &Path, options: &InitOptions) -> Result<EnvManifest>
         .clone()
         .map(Ok)
         .unwrap_or_else(|| prompt_default("Environment name", &default_env_name(cwd)))?;
-    let base_image = options
-        .base_image
-        .clone()
-        .map(Ok)
-        .unwrap_or_else(|| prompt_default("Base image", DEFAULT_BASE_IMAGE))?;
+    let base_image = if options.extends.is_some() {
+        None
+    } else {
+        Some(
+            options
+                .base_image
+                .clone()
+                .map(Ok)
+                .unwrap_or_else(|| prompt_default("Base image", DEFAULT_BASE_IMAGE))?,
+        )
+    };
     let default_packages = match options.default_packages {
         Some(value) => value,
         None => prompt_yes_no("Include default packages", true)?,
     };
-    let mut packages = options.packages.clone();
-    packages.extend(prompt_list("Additional apt packages")?);
+    let mut presets = options.presets.clone();
+    presets.extend(prompt_list("Stack presets")?);
 
-    let mut commands = options.commands.clone();
-    commands.extend(prompt_repeated("Setup command")?);
-
-    Ok(EnvManifest {
+    let mut manifest = EnvManifest {
         name: Some(name),
-        base_image: Some(base_image),
+        extends: options.extends.clone(),
+        base_image,
         default_packages: (!default_packages).then_some(false),
-        packages,
-        commands,
         ..EnvManifest::default()
-    })
+    };
+    apply_presets(&mut manifest, &presets)?;
+
+    extend_unique(&mut manifest.packages, options.packages.clone());
+    extend_unique(
+        &mut manifest.packages,
+        prompt_list("Additional apt packages")?,
+    );
+
+    extend_unique(&mut manifest.commands, options.commands.clone());
+    extend_unique(&mut manifest.commands, prompt_repeated("Setup command")?);
+    manifest.git = git_config_from_options(options);
+
+    Ok(manifest)
+}
+
+fn git_config_from_options(options: &InitOptions) -> Option<GitConfig> {
+    if options.git_user_name.is_none() && options.git_user_email.is_none() {
+        None
+    } else {
+        Some(GitConfig {
+            user_name: options.git_user_name.clone(),
+            user_email: options.git_user_email.clone(),
+        })
+    }
+}
+
+fn apply_presets(manifest: &mut EnvManifest, presets: &[String]) -> Result<()> {
+    for preset in expand_presets(presets) {
+        match preset.as_str() {
+            "node" => {
+                if manifest.base_image.is_none() && manifest.extends.is_none() {
+                    manifest.base_image = Some(DEFAULT_BASE_IMAGE.to_string());
+                }
+            }
+            "python" => {
+                extend_unique(
+                    &mut manifest.packages,
+                    ["python3", "python3-pip", "python3-venv"]
+                        .into_iter()
+                        .map(ToString::to_string),
+                );
+            }
+            "rust" => {
+                extend_unique(
+                    &mut manifest.commands,
+                    [
+                        RUST_INSTALL_COMMAND,
+                        RUSTUP_COMMAND,
+                        RUST_COMPONENTS_COMMAND,
+                        RUST_PERMISSIONS_COMMAND,
+                    ]
+                    .into_iter()
+                    .map(ToString::to_string),
+                );
+                manifest
+                    .runtime_env
+                    .insert("CARGO_HOME".to_string(), "/opt/cargo".to_string());
+                manifest
+                    .runtime_env
+                    .insert("RUSTUP_HOME".to_string(), "/opt/rustup".to_string());
+                manifest
+                    .runtime_env
+                    .insert("PATH".to_string(), RUST_PATH.to_string());
+            }
+            "tauri" => {
+                extend_unique(
+                    &mut manifest.packages,
+                    TAURI_PACKAGES.iter().map(|package| package.to_string()),
+                );
+            }
+            _ => bail!("unknown preset `{preset}`; expected one of: node, python, rust, tauri"),
+        }
+    }
+    Ok(())
+}
+
+fn expand_presets(presets: &[String]) -> Vec<String> {
+    let mut expanded = Vec::new();
+    for preset in presets {
+        match normalize_preset(preset).as_deref() {
+            Some("tauri") => {
+                push_unique(&mut expanded, "node".to_string());
+                push_unique(&mut expanded, "rust".to_string());
+                push_unique(&mut expanded, "tauri".to_string());
+            }
+            Some(name) => push_unique(&mut expanded, name.to_string()),
+            None => {}
+        }
+    }
+    expanded
+}
+
+fn normalize_preset(preset: &str) -> Option<String> {
+    let normalized = preset.trim().to_ascii_lowercase();
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn extend_unique(target: &mut Vec<String>, values: impl IntoIterator<Item = String>) {
+    for value in values {
+        push_unique(target, value);
+    }
+}
+
+fn push_unique(target: &mut Vec<String>, value: String) {
+    if !target.contains(&value) {
+        target.push(value);
+    }
 }
 
 pub fn resolve_env(env: Option<&str>, cwd: &Path) -> Result<ResolvedEnv> {
     if let Some(env) = env {
-        let candidate = PathBuf::from(env);
+        let candidate = if Path::new(env).is_absolute() {
+            PathBuf::from(env)
+        } else {
+            cwd.join(env)
+        };
         if candidate.exists() {
             return load_manifest(candidate, EnvSource::Explicit);
         }
@@ -252,10 +435,14 @@ pub fn resolve_env(env: Option<&str>, cwd: &Path) -> Result<ResolvedEnv> {
             return Ok(project);
         }
 
-        if let Some(path) = user_env_path(env) {
-            if path.exists() {
-                return load_manifest(path, EnvSource::User);
-            }
+        if let Some(path) = user_env_path(env)
+            && path.exists()
+        {
+            return load_manifest(path, EnvSource::User);
+        }
+
+        if env == "default" {
+            return Ok(builtin_env());
         }
 
         bail!("environment `{env}` was not found as a path, repo manifest name, or user env");
@@ -266,29 +453,42 @@ pub fn resolve_env(env: Option<&str>, cwd: &Path) -> Result<ResolvedEnv> {
         return load_manifest(project_path, EnvSource::Project);
     }
 
-    Ok(ResolvedEnv {
+    Ok(builtin_env())
+}
+
+fn builtin_env() -> ResolvedEnv {
+    ResolvedEnv {
         source: EnvSource::BuiltIn,
         manifest: EnvManifest {
             name: Some("default".to_string()),
             base_image: Some(DEFAULT_BASE_IMAGE.to_string()),
             ..EnvManifest::default()
         },
-    })
+    }
 }
 
 pub fn render_dockerfile(manifest: &EnvManifest) -> String {
+    render_dockerfile_from(
+        manifest,
+        manifest.base_image.as_deref().unwrap_or(DEFAULT_BASE_IMAGE),
+        false,
+    )
+}
+
+fn render_inherited_dockerfile(manifest: &EnvManifest, parent_tag: &str) -> String {
+    render_dockerfile_from(manifest, parent_tag, true)
+}
+
+fn render_dockerfile_from(manifest: &EnvManifest, base_image: &str, inherited: bool) -> String {
     let mut lines = Vec::new();
 
-    if let Some(hooks) = &manifest.dockerfile {
-        if let Some(prepend) = &hooks.prepend {
-            lines.push(prepend.trim_end().to_string());
-        }
+    if let Some(hooks) = &manifest.dockerfile
+        && let Some(prepend) = &hooks.prepend
+    {
+        lines.push(prepend.trim_end().to_string());
     }
 
-    lines.push(format!(
-        "FROM {}",
-        manifest.base_image.as_deref().unwrap_or(DEFAULT_BASE_IMAGE)
-    ));
+    lines.push(format!("FROM {base_image}"));
 
     lines.push("SHELL [\"/bin/sh\", \"-c\"]".to_string());
 
@@ -296,7 +496,11 @@ pub fn render_dockerfile(manifest: &EnvManifest) -> String {
         lines.push(format!("ENV {}={}", key, shell_escape(value)));
     }
 
-    let packages = resolved_packages(manifest);
+    let packages = if inherited {
+        manifest.packages.clone()
+    } else {
+        resolved_packages(manifest)
+    };
     if !packages.is_empty() {
         lines.push(format!(
             "RUN apt-get update && apt-get install -y --no-install-recommends {} && rm -rf /var/lib/apt/lists/*",
@@ -308,20 +512,113 @@ pub fn render_dockerfile(manifest: &EnvManifest) -> String {
         lines.push(format!("RUN {command}"));
     }
 
-    lines.push(format!(
-        "RUN {}",
-        manifest.pi_install.as_deref().unwrap_or(DEFAULT_PI_INSTALL)
-    ));
-    lines.push("RUN mkdir -p /tmp/pi-home && chmod 0777 /tmp/pi-home".to_string());
+    if !inherited || manifest.pi_install.is_some() {
+        lines.push(format!(
+            "RUN {}",
+            manifest.pi_install.as_deref().unwrap_or(DEFAULT_PI_INSTALL)
+        ));
+    }
+    if !inherited {
+        lines.push("RUN mkdir -p /tmp/pi-home && chmod 0777 /tmp/pi-home".to_string());
+    }
 
-    if let Some(hooks) = &manifest.dockerfile {
-        if let Some(append) = &hooks.append {
-            lines.push(append.trim_end().to_string());
-        }
+    for (key, value) in &manifest.runtime_env {
+        lines.push(format!("ENV {}={}", key, shell_escape(value)));
+    }
+
+    if let Some(hooks) = &manifest.dockerfile
+        && let Some(append) = &hooks.append
+    {
+        lines.push(append.trim_end().to_string());
     }
 
     lines.push(String::new());
     lines.join("\n")
+}
+
+fn prepare_environment(resolved: &ResolvedEnv, cwd: &Path) -> Result<PreparedEnvironment> {
+    let mut images = Vec::new();
+    let mut ancestors = Vec::new();
+    let (_, git) = prepare_image_recursive(resolved, cwd, &mut ancestors, &mut images)?;
+    Ok(PreparedEnvironment { images, git })
+}
+
+fn prepare_image_recursive(
+    resolved: &ResolvedEnv,
+    cwd: &Path,
+    ancestors: &mut Vec<String>,
+    images: &mut Vec<PreparedImage>,
+) -> Result<(String, Option<GitConfig>)> {
+    let fingerprint = source_fingerprint(&resolved.source);
+    if ancestors.contains(&fingerprint) {
+        let mut chain = ancestors.clone();
+        chain.push(fingerprint);
+        bail!("environment inheritance cycle: {}", chain.join(" -> "));
+    }
+    ancestors.push(fingerprint);
+
+    let (dockerfile, inherited_git) = if let Some(parent_ref) = resolved.manifest.extends.as_deref()
+    {
+        if resolved.manifest.base_image.is_some() {
+            bail!("an environment cannot set both `extends` and `base_image`");
+        }
+        let parent = resolve_parent_env(parent_ref, &resolved.source, cwd)?;
+        let (parent_tag, parent_git) = prepare_image_recursive(&parent, cwd, ancestors, images)?;
+        (
+            render_inherited_dockerfile(&resolved.manifest, &parent_tag),
+            parent_git,
+        )
+    } else {
+        (render_dockerfile(&resolved.manifest), None)
+    };
+
+    ancestors.pop();
+    let tag = image_tag(&dockerfile);
+    if !images.iter().any(|image| image.tag == tag) {
+        images.push(PreparedImage {
+            tag: tag.clone(),
+            dockerfile,
+        });
+    }
+    let git = merge_git_config(inherited_git, resolved.manifest.git.as_ref());
+    Ok((tag, git))
+}
+
+fn merge_git_config(parent: Option<GitConfig>, child: Option<&GitConfig>) -> Option<GitConfig> {
+    let mut merged = parent.unwrap_or_default();
+    if let Some(child) = child {
+        if child.user_name.is_some() {
+            merged.user_name.clone_from(&child.user_name);
+        }
+        if child.user_email.is_some() {
+            merged.user_email.clone_from(&child.user_email);
+        }
+    }
+
+    (merged.user_name.is_some() || merged.user_email.is_some()).then_some(merged)
+}
+
+fn resolve_parent_env(reference: &str, source: &EnvSource, cwd: &Path) -> Result<ResolvedEnv> {
+    let parent_dir = match source {
+        EnvSource::Project(path) | EnvSource::User(path) | EnvSource::Explicit(path) => {
+            path.parent().unwrap_or(cwd)
+        }
+        EnvSource::BuiltIn => cwd,
+    };
+    resolve_env(Some(reference), parent_dir)
+        .with_context(|| format!("failed to resolve parent environment `{reference}`"))
+}
+
+fn show_images(images: &[PreparedImage]) {
+    for (index, image) in images.iter().enumerate() {
+        if images.len() > 1 {
+            if index > 0 {
+                println!();
+            }
+            println!("# image {}", image.tag);
+        }
+        print!("{}", image.dockerfile);
+    }
 }
 
 pub fn resolved_packages(manifest: &EnvManifest) -> Vec<String> {
@@ -339,27 +636,60 @@ pub fn resolved_packages(manifest: &EnvManifest) -> Vec<String> {
     packages
 }
 
-pub fn build_invocation(cache: &Path, tag: &str) -> Result<DockerInvocation> {
+pub fn build_invocation(cache: &Path, tag: &str, pull: bool) -> Result<DockerInvocation> {
     let dockerfile = cache.join(tag).join("Dockerfile");
     let context = dockerfile
         .parent()
         .context("resolved Dockerfile path has no parent")?;
 
+    let mut args = vec!["build".to_string()];
+    if pull {
+        args.push("--pull".to_string());
+    }
+    args.extend([
+        "-t".to_string(),
+        tag.to_string(),
+        "-f".to_string(),
+        dockerfile.display().to_string(),
+        context.display().to_string(),
+    ]);
+
     Ok(DockerInvocation {
         program: "docker".to_string(),
-        args: vec![
-            "build".to_string(),
-            "-t".to_string(),
-            tag.to_string(),
-            "-f".to_string(),
-            dockerfile.display().to_string(),
-            context.display().to_string(),
-        ],
+        args,
     })
+}
+
+fn ensure_image(cache: &Path, tag: &str, rebuild: bool, pull: bool) -> Result<()> {
+    if !rebuild && !pull && docker_image_exists(tag)? {
+        println!("Reusing image {tag}");
+        return Ok(());
+    }
+
+    run_process(build_invocation(cache, tag, pull)?)
+}
+
+fn build_images(cache: &Path, images: &[PreparedImage], rebuild: bool, pull: bool) -> Result<()> {
+    for (index, image) in images.iter().enumerate() {
+        write_resolved_dockerfile(cache, &image.tag, &image.dockerfile)?;
+        ensure_image(cache, &image.tag, rebuild || pull, pull && index == 0)?;
+    }
+    Ok(())
+}
+
+fn docker_image_exists(tag: &str) -> Result<bool> {
+    let status = ProcessCommand::new("docker")
+        .args(["image", "inspect", tag])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .context("failed to inspect local Docker images")?;
+    Ok(status.success())
 }
 
 pub fn run_invocation(
     cwd: &Path,
+    home: &Path,
     tag: &str,
     uid: &str,
     gid: &str,
@@ -375,6 +705,8 @@ pub fn run_invocation(
         "HOME=/tmp/pi-home".to_string(),
         "-v".to_string(),
         format!("{}:/workspace", cwd.display()),
+        "-v".to_string(),
+        format!("{}:/tmp/pi-home", home.display()),
         "-w".to_string(),
         "/workspace".to_string(),
         tag.to_string(),
@@ -402,7 +734,61 @@ pub fn run_invocation(
     }
 }
 
+pub fn persistent_home_dir(cwd: &Path, resolved: &ResolvedEnv) -> Result<PathBuf> {
+    let base = dirs::config_dir()
+        .context("could not determine user config directory")?
+        .join("pi-sandbox")
+        .join("homes");
+    let mut input = cwd.display().to_string();
+    input.push('\n');
+    input.push_str(&source_fingerprint(&resolved.source));
+    input.push('\n');
+    input.push_str(resolved.manifest.name.as_deref().unwrap_or("default"));
+
+    let name = format!("{}-{:x}", project_slug(cwd), fnv1a64(input.as_bytes()));
+    let path = base.join(name);
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create persistent home {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn seed_git_config(home: &Path, git: Option<&GitConfig>) -> Result<()> {
+    let Some(git) = git else {
+        return Ok(());
+    };
+
+    fs::create_dir_all(home)
+        .with_context(|| format!("failed to create persistent home {}", home.display()))?;
+    let gitconfig = home.join(".gitconfig");
+
+    if let Some(name) = &git.user_name {
+        run_git_config(&gitconfig, "user.name", name)?;
+    }
+    if let Some(email) = &git.user_email {
+        run_git_config(&gitconfig, "user.email", email)?;
+    }
+
+    Ok(())
+}
+
+fn run_git_config(gitconfig: &Path, key: &str, value: &str) -> Result<()> {
+    let status = ProcessCommand::new("git")
+        .arg("config")
+        .arg("--file")
+        .arg(gitconfig)
+        .arg(key)
+        .arg(value)
+        .status()
+        .context("failed to run git config")?;
+    if !status.success() {
+        bail!("git config failed with status {status}");
+    }
+    Ok(())
+}
+
 fn load_manifest(path: PathBuf, source: impl FnOnce(PathBuf) -> EnvSource) -> Result<ResolvedEnv> {
+    let path = fs::canonicalize(&path)
+        .with_context(|| format!("failed to resolve manifest path {}", path.display()))?;
     let text = fs::read_to_string(&path)
         .with_context(|| format!("failed to read manifest {}", path.display()))?;
     let manifest: EnvManifest = toml::from_str(&text)
@@ -419,6 +805,27 @@ fn default_env_name(cwd: &Path) -> String {
         .filter(|name| !name.is_empty())
         .unwrap_or("project")
         .to_string()
+}
+
+fn project_slug(cwd: &Path) -> String {
+    let slug = default_env_name(cwd)
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() {
+                c.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+
+    if slug.is_empty() {
+        "project".to_string()
+    } else {
+        slug
+    }
 }
 
 fn prompt_default(label: &str, default: &str) -> Result<String> {
@@ -543,20 +950,20 @@ fn list_envs(cwd: &Path) -> Result<()> {
         println!("project\t{}\t{}", name, project_path.display());
     }
 
-    if let Some(dir) = user_env_dir() {
-        if dir.exists() {
-            for entry in fs::read_dir(&dir)
-                .with_context(|| format!("failed to read env dir {}", dir.display()))?
-            {
-                let entry = entry?;
-                let path = entry.path();
-                if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
-                    let name = path
-                        .file_stem()
-                        .and_then(|stem| stem.to_str())
-                        .unwrap_or("?");
-                    println!("user\t{name}\t{}", path.display());
-                }
+    if let Some(dir) = user_env_dir()
+        && dir.exists()
+    {
+        for entry in fs::read_dir(&dir)
+            .with_context(|| format!("failed to read env dir {}", dir.display()))?
+        {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|ext| ext.to_str()) == Some("toml") {
+                let name = path
+                    .file_stem()
+                    .and_then(|stem| stem.to_str())
+                    .unwrap_or("?");
+                println!("user\t{name}\t{}", path.display());
             }
         }
     }
@@ -565,32 +972,9 @@ fn list_envs(cwd: &Path) -> Result<()> {
     Ok(())
 }
 
-fn image_tag(resolved: &ResolvedEnv) -> String {
-    let input = format!(
-        "{}\n{}",
-        render_dockerfile(&resolved.manifest),
-        source_fingerprint(&resolved.source)
-    );
-    let hash = fnv1a64(input.as_bytes());
-    let mut name = resolved
-        .manifest
-        .name
-        .as_deref()
-        .unwrap_or("default")
-        .chars()
-        .map(|c| {
-            if c.is_ascii_alphanumeric() {
-                c.to_ascii_lowercase()
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>();
-    name = name.trim_matches('-').to_string();
-    if name.is_empty() {
-        name = "default".to_string();
-    }
-    format!("pi-sandbox-{name}:{hash:x}")
+fn image_tag(dockerfile: &str) -> String {
+    let hash = fnv1a64(dockerfile.as_bytes());
+    format!("pi-sandbox-env:{hash:016x}")
 }
 
 fn fnv1a64(bytes: &[u8]) -> u64 {
@@ -676,14 +1060,17 @@ mod tests {
     fn renders_manifest_packages_env_commands_and_hooks() {
         let manifest = EnvManifest {
             name: Some("rust".to_string()),
+            extends: None,
             base_image: Some("node:22-bookworm".to_string()),
             default_packages: Some(false),
             packages: vec!["git".to_string(), "curl".to_string()],
             env: BTreeMap::from([("RUSTUP_HOME".to_string(), "/opt/rustup".to_string())]),
+            runtime_env: BTreeMap::new(),
             commands: vec!["npm --version".to_string()],
             pi_install: Some(
                 "npm install -g --ignore-scripts @earendil-works/pi-coding-agent".to_string(),
             ),
+            git: None,
             dockerfile: Some(DockerfileHooks {
                 prepend: Some("# syntax=docker/dockerfile:1".to_string()),
                 append: Some("RUN true".to_string()),
@@ -748,12 +1135,16 @@ mod tests {
             force: false,
             name: None,
             base_image: None,
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
             default_packages: Some(true),
+            presets: Vec::new(),
             packages: Vec::new(),
             commands: Vec::new(),
         };
 
-        let manifest = init_manifest_from_options(dir.path(), &options);
+        let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
 
         assert_eq!(
             manifest.name.as_deref(),
@@ -762,6 +1153,164 @@ mod tests {
         assert_eq!(manifest.base_image.as_deref(), Some(DEFAULT_BASE_IMAGE));
         assert_eq!(manifest.default_packages, None);
         assert!(manifest.packages.is_empty());
+    }
+
+    #[test]
+    fn runtime_env_renders_after_install_layers() {
+        let manifest = EnvManifest {
+            commands: vec!["expensive install".to_string()],
+            runtime_env: BTreeMap::from([("PATH".to_string(), "/opt/bin:/usr/bin".to_string())]),
+            ..EnvManifest::default()
+        };
+
+        let dockerfile = render_dockerfile(&manifest);
+        let command_index = dockerfile.find("RUN expensive install").unwrap();
+        let pi_index = dockerfile.find(DEFAULT_PI_INSTALL).unwrap();
+        let path_index = dockerfile.find("ENV PATH=/opt/bin:/usr/bin").unwrap();
+
+        assert!(command_index < pi_index);
+        assert!(pi_index < path_index);
+    }
+
+    #[test]
+    fn rust_preset_installs_rust_into_opt_runtime_env() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: Some("rust-app".to_string()),
+            base_image: None,
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(true),
+            presets: vec!["rust".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
+
+        assert!(manifest.commands.contains(&RUSTUP_COMMAND.to_string()));
+        assert!(
+            manifest
+                .commands
+                .contains(&RUST_COMPONENTS_COMMAND.to_string())
+        );
+        assert_eq!(
+            manifest.runtime_env.get("CARGO_HOME").map(String::as_str),
+            Some("/opt/cargo")
+        );
+        assert_eq!(
+            manifest.runtime_env.get("PATH").map(String::as_str),
+            Some(RUST_PATH)
+        );
+    }
+
+    #[test]
+    fn tauri_preset_implies_node_rust_and_tauri_packages() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: Some("tauri-app".to_string()),
+            base_image: None,
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(true),
+            presets: vec!["tauri".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
+
+        assert_eq!(manifest.base_image.as_deref(), Some(DEFAULT_BASE_IMAGE));
+        assert!(manifest.commands.contains(&RUSTUP_COMMAND.to_string()));
+        assert!(manifest.packages.contains(&"libgtk-3-dev".to_string()));
+        assert!(
+            manifest
+                .packages
+                .contains(&"libwebkit2gtk-4.1-dev".to_string())
+        );
+    }
+
+    #[test]
+    fn unknown_preset_errors() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: None,
+            base_image: None,
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(true),
+            presets: vec!["unknown".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let err = init_manifest_from_options(dir.path(), &options).unwrap_err();
+
+        assert!(err.to_string().contains("unknown preset"));
+    }
+
+    #[test]
+    fn init_manifest_includes_git_config_from_options() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: Some("repo".to_string()),
+            base_image: None,
+            extends: None,
+            git_user_name: Some("Dan".to_string()),
+            git_user_email: Some("dan@example.com".to_string()),
+            default_packages: Some(true),
+            presets: Vec::new(),
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
+
+        assert_eq!(
+            manifest
+                .git
+                .as_ref()
+                .and_then(|git| git.user_name.as_deref()),
+            Some("Dan")
+        );
+        assert_eq!(
+            manifest
+                .git
+                .as_ref()
+                .and_then(|git| git.user_email.as_deref()),
+            Some("dan@example.com")
+        );
+    }
+
+    #[test]
+    fn seed_git_config_writes_persistent_home_gitconfig() {
+        let dir = tempdir().unwrap();
+        let home = dir.path().join("home");
+
+        seed_git_config(
+            &home,
+            Some(&GitConfig {
+                user_name: Some("Dan".to_string()),
+                user_email: Some("dan@example.com".to_string()),
+            }),
+        )
+        .unwrap();
+
+        let gitconfig = fs::read_to_string(home.join(".gitconfig")).unwrap();
+
+        assert!(gitconfig.contains("name = Dan"));
+        assert!(gitconfig.contains("email = dan@example.com"));
     }
 
     #[test]
@@ -823,6 +1372,7 @@ mod tests {
     fn run_invocation_uses_host_identity_and_workspace_mount() {
         let args = run_invocation(
             Path::new("/repo"),
+            Path::new("/config/pi-sandbox/homes/repo-abc"),
             "pi-sandbox-default:abc",
             "501",
             "20",
@@ -848,6 +1398,11 @@ mod tests {
         assert!(
             args.args
                 .windows(2)
+                .any(|pair| pair == ["-v", "/config/pi-sandbox/homes/repo-abc:/tmp/pi-home"])
+        );
+        assert!(
+            args.args
+                .windows(2)
                 .any(|pair| pair == ["-w", "/workspace"])
         );
         assert!(args.args.windows(2).any(|pair| pair == ["sh", "-c"]));
@@ -863,7 +1418,7 @@ mod tests {
     #[test]
     fn build_invocation_points_at_cached_dockerfile() {
         let invocation =
-            build_invocation(Path::new("/cache/pi-sandbox"), "pi-sandbox-default:abc").unwrap();
+            build_invocation(Path::new("/cache/pi-sandbox"), "pi-sandbox-env:abc", false).unwrap();
 
         assert_eq!(invocation.program, "docker");
         assert_eq!(
@@ -871,28 +1426,172 @@ mod tests {
             vec![
                 "build",
                 "-t",
-                "pi-sandbox-default:abc",
+                "pi-sandbox-env:abc",
                 "-f",
-                "/cache/pi-sandbox/pi-sandbox-default:abc/Dockerfile",
-                "/cache/pi-sandbox/pi-sandbox-default:abc",
+                "/cache/pi-sandbox/pi-sandbox-env:abc/Dockerfile",
+                "/cache/pi-sandbox/pi-sandbox-env:abc",
             ]
         );
     }
 
     #[test]
-    fn image_tag_is_deterministic_and_sanitized() {
-        let resolved = ResolvedEnv {
-            source: EnvSource::BuiltIn,
-            manifest: EnvManifest {
-                name: Some("Rust + Node!".to_string()),
-                ..EnvManifest::default()
-            },
+    fn pull_build_invocation_refreshes_the_base_image() {
+        let invocation =
+            build_invocation(Path::new("/cache/pi-sandbox"), "pi-sandbox-env:abc", true).unwrap();
+
+        assert_eq!(invocation.args[0..2], ["build", "--pull"]);
+    }
+
+    #[test]
+    fn image_tag_is_deterministic_and_independent_of_project_metadata() {
+        let first = EnvManifest {
+            name: Some("first".to_string()),
+            git: Some(GitConfig {
+                user_name: Some("First User".to_string()),
+                user_email: None,
+            }),
+            ..EnvManifest::default()
+        };
+        let second = EnvManifest {
+            name: Some("second".to_string()),
+            git: Some(GitConfig {
+                user_name: Some("Second User".to_string()),
+                user_email: None,
+            }),
+            ..EnvManifest::default()
         };
 
-        let first = image_tag(&resolved);
-        let second = image_tag(&resolved);
+        let first_tag = image_tag(&render_dockerfile(&first));
+        let second_tag = image_tag(&render_dockerfile(&second));
 
-        assert_eq!(first, second);
-        assert!(first.starts_with("pi-sandbox-rust---node:"));
+        assert_eq!(first_tag, second_tag);
+        assert!(first_tag.starts_with("pi-sandbox-env:"));
+        assert_eq!(first_tag.len(), "pi-sandbox-env:".len() + 16);
+    }
+
+    #[test]
+    fn image_tag_changes_when_build_content_changes() {
+        let first = EnvManifest::default();
+        let second = EnvManifest {
+            packages: vec!["ripgrep".to_string()],
+            ..EnvManifest::default()
+        };
+
+        assert_ne!(
+            image_tag(&render_dockerfile(&first)),
+            image_tag(&render_dockerfile(&second))
+        );
+    }
+
+    #[test]
+    fn inherited_environment_builds_on_the_parent_image() {
+        let dir = tempdir().unwrap();
+        fs::write(
+            dir.path().join("base.toml"),
+            r#"
+name = "rust"
+base_image = "node:22-bookworm"
+packages = ["ripgrep"]
+
+[git]
+user_name = "Parent User"
+user_email = "parent@example.com"
+"#,
+        )
+        .unwrap();
+        fs::write(
+            dir.path().join(PROJECT_MANIFEST),
+            r#"
+name = "tauri"
+extends = "base.toml"
+packages = ["libgtk-3-dev"]
+
+[git]
+user_email = "child@example.com"
+"#,
+        )
+        .unwrap();
+
+        let resolved = resolve_env(None, dir.path()).unwrap();
+        let prepared = prepare_environment(&resolved, dir.path()).unwrap();
+
+        assert_eq!(prepared.images.len(), 2);
+        let parent = &prepared.images[0];
+        let child = &prepared.images[1];
+        assert!(parent.dockerfile.contains("FROM node:22-bookworm"));
+        assert!(parent.dockerfile.contains("ripgrep"));
+        assert!(parent.dockerfile.contains(DEFAULT_PI_INSTALL));
+        assert!(
+            child
+                .dockerfile
+                .starts_with(&format!("FROM {}", parent.tag))
+        );
+        assert!(child.dockerfile.contains("libgtk-3-dev"));
+        assert!(!child.dockerfile.contains(DEFAULT_PI_INSTALL));
+        assert!(!child.dockerfile.contains("build-essential"));
+        assert_eq!(
+            prepared
+                .git
+                .as_ref()
+                .and_then(|git| git.user_name.as_deref()),
+            Some("Parent User")
+        );
+        assert_eq!(
+            prepared
+                .git
+                .as_ref()
+                .and_then(|git| git.user_email.as_deref()),
+            Some("child@example.com")
+        );
+    }
+
+    #[test]
+    fn inherited_image_tag_changes_with_its_parent() {
+        let dir = tempdir().unwrap();
+        let parent = dir.path().join("base.toml");
+        fs::write(&parent, "packages = [\"ripgrep\"]\n").unwrap();
+        fs::write(
+            dir.path().join(PROJECT_MANIFEST),
+            "extends = \"base.toml\"\npackages = [\"fd-find\"]\n",
+        )
+        .unwrap();
+        let resolved = resolve_env(None, dir.path()).unwrap();
+        let first = prepare_environment(&resolved, dir.path()).unwrap();
+
+        fs::write(&parent, "packages = [\"jq\"]\n").unwrap();
+        let second = prepare_environment(&resolved, dir.path()).unwrap();
+
+        assert_ne!(
+            first.images.last().unwrap().tag,
+            second.images.last().unwrap().tag
+        );
+    }
+
+    #[test]
+    fn environment_inheritance_cycles_are_rejected() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("a.toml"), "extends = \"b.toml\"\n").unwrap();
+        fs::write(dir.path().join("b.toml"), "extends = \"a.toml\"\n").unwrap();
+        let resolved = resolve_env(Some("a.toml"), dir.path()).unwrap();
+
+        let err = prepare_environment(&resolved, dir.path()).unwrap_err();
+
+        assert!(err.to_string().contains("inheritance cycle"));
+    }
+
+    #[test]
+    fn inherited_environment_cannot_also_set_a_base_image() {
+        let dir = tempdir().unwrap();
+        fs::write(dir.path().join("base.toml"), "name = \"base\"\n").unwrap();
+        fs::write(
+            dir.path().join(PROJECT_MANIFEST),
+            "extends = \"base.toml\"\nbase_image = \"node:20-bookworm\"\n",
+        )
+        .unwrap();
+        let resolved = resolve_env(None, dir.path()).unwrap();
+
+        let err = prepare_environment(&resolved, dir.path()).unwrap_err();
+
+        assert!(err.to_string().contains("both `extends` and `base_image`"));
     }
 }

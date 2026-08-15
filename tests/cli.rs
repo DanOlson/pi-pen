@@ -42,6 +42,32 @@ fn subcommand_help_flag_prints_usage() {
 }
 
 #[test]
+fn build_help_includes_image_refresh_controls() {
+    let output = Command::new(bin())
+        .args(["build", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--rebuild"));
+    assert!(stdout.contains("--pull"));
+}
+
+#[test]
+fn run_help_includes_image_refresh_controls() {
+    let output = Command::new(bin())
+        .args(["run", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("--rebuild"));
+    assert!(stdout.contains("--pull"));
+}
+
+#[test]
 fn env_show_renders_builtin_default() {
     let dir = tempdir().unwrap();
     let output = Command::new(bin())
@@ -80,6 +106,35 @@ packages = ["ripgrep"]
     assert!(stdout.contains("FROM node:20-bookworm"));
     assert!(stdout.contains("build-essential"));
     assert!(stdout.contains("ripgrep"));
+}
+
+#[test]
+fn env_show_renders_an_inherited_image_chain() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join("base.toml"),
+        "name = \"base\"\npackages = [\"ripgrep\"]\n",
+    )
+    .unwrap();
+    fs::write(
+        dir.path().join(".pi-env.toml"),
+        "name = \"child\"\nextends = \"base.toml\"\npackages = [\"fd-find\"]\n",
+    )
+    .unwrap();
+
+    let output = Command::new(bin())
+        .args(["env", "show"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert_eq!(stdout.matches("# image pi-sandbox-env:").count(), 2);
+    assert!(stdout.contains("FROM node:22-bookworm"));
+    assert!(stdout.contains("FROM pi-sandbox-env:"));
+    assert!(stdout.contains("ripgrep"));
+    assert!(stdout.contains("fd-find"));
 }
 
 #[test]
@@ -140,6 +195,75 @@ fn init_flags_write_manifest_overrides() {
     assert!(manifest.contains("default_packages = false"));
     assert!(manifest.contains("packages = [\"ripgrep\"]"));
     assert!(manifest.contains("commands = [\"npm --version\"]"));
+}
+
+#[test]
+fn init_extends_writes_parent_without_a_base_image() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args(["init", "--yes", "--extends", "rust-node"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
+    assert!(manifest.contains("extends = \"rust-node\""));
+    assert!(!manifest.contains("base_image"));
+}
+
+#[test]
+fn init_git_flags_write_git_section() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args([
+            "init",
+            "--yes",
+            "--git-user-name",
+            "Dan",
+            "--git-user-email",
+            "dan@example.com",
+        ])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
+    assert!(manifest.contains("[git]"));
+    assert!(manifest.contains("user_name = \"Dan\""));
+    assert!(manifest.contains("user_email = \"dan@example.com\""));
+}
+
+#[test]
+fn init_with_tauri_writes_preset_manifest() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args(["init", "--yes", "--with", "tauri"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
+    assert!(manifest.contains("libgtk-3-dev"));
+    assert!(manifest.contains("libwebkit2gtk-4.1-dev"));
+    assert!(manifest.contains("/opt/cargo/bin"));
+    assert!(manifest.contains("[runtime_env]"));
+}
+
+#[test]
+fn init_with_unknown_preset_fails() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args(["init", "--yes", "--with", "nope"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stderr.contains("unknown preset"));
 }
 
 #[test]

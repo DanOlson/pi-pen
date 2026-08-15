@@ -39,8 +39,8 @@ cargo install --path . --force
 
 ```sh
 pi-sandbox init
-pi-sandbox run [ENV] [-- <pi args...>]
-pi-sandbox build [ENV]
+pi-sandbox run [ENV] [--rebuild] [--pull] [-- <pi args...>]
+pi-sandbox build [ENV] [--rebuild] [--pull]
 pi-sandbox env list
 pi-sandbox env show [ENV]
 ```
@@ -73,9 +73,22 @@ Common overrides:
 
 ```sh
 pi-sandbox init --yes --name my-env --base-image node:22-bookworm
+pi-sandbox init --yes --extends rust-node
+pi-sandbox init --yes --with rust,node
+pi-sandbox init --yes --with tauri
+pi-sandbox init --yes --git-user-name "Your Name" --git-user-email you@example.com
 pi-sandbox init --yes --no-default-packages --package ripgrep
 pi-sandbox init --force
 ```
+
+Stack presets expand into plain manifest content:
+
+- `node`: use the default Node LTS base image.
+- `python`: add Python runtime packages.
+- `rust`: install Rust under `/opt/cargo` and `/opt/rustup`, add `rustfmt`
+  and `clippy`, and set runtime Cargo/Rust environment.
+- `tauri`: includes `node` and `rust`, then adds common Tauri v2 Linux build
+  dependencies.
 
 ## Environment Discovery
 
@@ -87,6 +100,38 @@ Resolution order:
    `pi-sandbox/envs/<name>.toml`.
 4. Built-in default environment based on `node:22-bookworm` plus a practical
    Debian package baseline.
+
+## Reusing Images
+
+Images are named from their rendered build content, using tags such as
+`pi-sandbox-env:0123456789abcdef`. Environment names, project paths, Git
+identity, and persistent-home paths are not part of that tag. Two projects with
+the same build definition therefore use the same local image. `build` and `run`
+skip `docker build` when that image already exists.
+
+Use `--rebuild` to run Docker's build again while retaining Docker's normal
+layer cache. Use `--pull` to rebuild and check for a newer external base image.
+
+An environment can add layers to another environment with `extends`:
+
+```toml
+name = "tauri-app"
+extends = "rust-node"
+packages = ["libgtk-3-dev", "libwebkit2gtk-4.1-dev"]
+```
+
+The parent is resolved using the normal environment rules. Relative manifest
+paths are resolved from the child manifest's directory. The parent is built as
+its own content-addressed image, and the child Dockerfile starts from that image
+and installs only the child's additions. This lets a larger stack reuse a
+previously built subset rather than merely sharing the external base image.
+The default package baseline is installed by the root environment only;
+derived environments inherit it and do not install it again.
+
+Derived environments inherit the parent's installed tools, build and runtime
+environment variables, and Git identity defaults. Child Git fields override
+the corresponding parent fields. `extends` and `base_image` cannot be used in
+the same manifest.
 
 ## Manifest Format
 
@@ -100,6 +145,13 @@ commands = [
 
 [env]
 RUSTUP_HOME = "/opt/rustup"
+
+[runtime_env]
+PATH = "/opt/cargo/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
+
+[git]
+user_name = "Your Name"
+user_email = "you@example.com"
 
 [dockerfile]
 prepend = "# syntax=docker/dockerfile:1"
@@ -143,17 +195,29 @@ RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
 Override that command with `pi_install` only when testing a different agent
 package or install source.
 
+Use `[env]` for variables needed while building the image. Use `[runtime_env]`
+for variables only needed when the container runs, such as final `PATH` values;
+runtime env is rendered after install commands so edits are less likely to
+invalidate expensive Docker layers.
+
+Use `[git]` to seed Git identity into the container's persistent home without
+mounting host Git, SSH, or GitHub CLI config. On `run`, these values are written
+to `/tmp/pi-home/.gitconfig`.
+
 ## TODO
 
-- Improve Dockerfile rendering so runtime-only environment changes, especially
-  `PATH`, do not invalidate expensive install layers when possible.
-- Add a Rust preset to `pi-sandbox init` that installs Rust under `/opt/cargo`
-  and `/opt/rustup`, sets the correct runtime `PATH`, and works with the
-  non-root container user.
-- Add composable init presets, such as `--with rust,node` or `--with tauri`,
-  that expand into packages, setup commands, and env vars. Presets should dedupe
-  contributions, expand implied stacks like `tauri -> node + rust + Tauri Linux
-  deps`, and still write plain editable TOML.
+- Add optional explicit host mounts for tool config such as SSH keys, cloud CLI
+  config, npm, and cargo when users want to share existing host credentials
+  with the container.
+
+## Persistent Home
+
+`pi-sandbox run` creates a per-project persistent home directory under the
+platform config directory, then mounts it at `/tmp/pi-home` in the container.
+This lets the pi agent and other tools keep credentials/config between runs
+even though each container is recreated.
+
+The project itself is still mounted separately at `/workspace`.
 
 ## File Ownership
 
