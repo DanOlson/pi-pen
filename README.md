@@ -84,11 +84,28 @@ pi-sandbox init --force
 Stack presets expand into plain manifest content:
 
 - `node`: use the default Node LTS base image.
-- `python`: add Python runtime packages.
+- `python`: add Python runtime packages and install pinned uv/uvx binaries.
 - `rust`: install Rust under `/opt/cargo` and `/opt/rustup`, add `rustfmt`
   and `clippy`, and set runtime Cargo/Rust environment.
 - `tauri`: includes `node` and `rust`, then adds common Tauri v2 Linux build
   dependencies.
+
+The Python preset installs uv 0.12.0 into `/usr/local/bin` as an unmanaged
+installation. Pinning the version keeps the generated environment reproducible;
+update the command in the manifest when you want to upgrade uv.
+
+For an existing manifest, ensure `ca-certificates` and `curl` are present, then
+append the installer to `commands`:
+
+```toml
+packages = ["ca-certificates", "curl"]
+commands = [
+  "curl --proto '=https' --tlsv1.2 -LsSf https://releases.astral.sh/github/uv/releases/download/0.12.0/uv-installer.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh"
+]
+```
+
+Merge those values into existing `packages` and `commands` arrays rather than
+declaring either TOML key a second time.
 
 ## Environment Discovery
 

@@ -35,6 +35,7 @@ const RUST_INSTALL_COMMAND: &str =
 const RUSTUP_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup sh -s -- -y --profile minimal --no-modify-path";
 const RUST_COMPONENTS_COMMAND: &str = "CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/cargo/bin/rustup component add rustfmt clippy";
 const RUST_PERMISSIONS_COMMAND: &str = "chmod -R a+rX /opt/cargo /opt/rustup";
+const UV_VERSION: &str = "0.12.0";
 const TAURI_PACKAGES: &[&str] = &[
     "file",
     "libssl-dev",
@@ -344,10 +345,17 @@ fn apply_presets(manifest: &mut EnvManifest, presets: &[String]) -> Result<()> {
             "python" => {
                 extend_unique(
                     &mut manifest.packages,
-                    ["python3", "python3-pip", "python3-venv"]
-                        .into_iter()
-                        .map(ToString::to_string),
+                    [
+                        "ca-certificates",
+                        "curl",
+                        "python3",
+                        "python3-pip",
+                        "python3-venv",
+                    ]
+                    .into_iter()
+                    .map(ToString::to_string),
                 );
+                push_unique(&mut manifest.commands, uv_install_command());
             }
             "rust" => {
                 extend_unique(
@@ -381,6 +389,12 @@ fn apply_presets(manifest: &mut EnvManifest, presets: &[String]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn uv_install_command() -> String {
+    format!(
+        "curl --proto '=https' --tlsv1.2 -LsSf https://releases.astral.sh/github/uv/releases/download/{UV_VERSION}/uv-installer.sh | env UV_UNMANAGED_INSTALL=/usr/local/bin sh"
+    )
 }
 
 fn expand_presets(presets: &[String]) -> Vec<String> {
@@ -1170,6 +1184,34 @@ mod tests {
 
         assert!(command_index < pi_index);
         assert!(pi_index < path_index);
+    }
+
+    #[test]
+    fn python_preset_installs_pinned_uv_for_non_root_users() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: Some("python-app".to_string()),
+            base_image: None,
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(false),
+            presets: vec!["python".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
+        let dockerfile = render_dockerfile(&manifest);
+
+        assert!(manifest.packages.contains(&"ca-certificates".to_string()));
+        assert!(manifest.packages.contains(&"curl".to_string()));
+        assert!(manifest.packages.contains(&"python3".to_string()));
+        assert!(manifest.commands.contains(&uv_install_command()));
+        assert!(dockerfile.contains(&format!("download/{UV_VERSION}/uv-installer.sh")));
+        assert!(dockerfile.contains("UV_UNMANAGED_INSTALL=/usr/local/bin"));
     }
 
     #[test]

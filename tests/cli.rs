@@ -236,6 +236,23 @@ fn init_git_flags_write_git_section() {
 }
 
 #[test]
+fn init_with_python_writes_pinned_uv_installer() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args(["init", "--yes", "--with", "python"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
+    assert!(manifest.contains("uv/releases/download/0.12.0/uv-installer.sh"));
+    assert!(manifest.contains("UV_UNMANAGED_INSTALL=/usr/local/bin"));
+    assert!(manifest.contains("ca-certificates"));
+    assert!(manifest.contains("curl"));
+}
+
+#[test]
 fn init_with_tauri_writes_preset_manifest() {
     let dir = tempdir().unwrap();
     let output = Command::new(bin())
