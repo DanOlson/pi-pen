@@ -40,6 +40,9 @@ cargo install --path . --force
 ```sh
 pi-sandbox init
 pi-sandbox run [ENV] [--rebuild] [--pull] [network options] [-- <pi args...>]
+pi-sandbox exec [ENV] (--prompt-file PATH | --prompt-stdin) --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
+pi-sandbox rpc [ENV] --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
+pi-sandbox stop --output-dir PATH [--grace SECONDS]
 pi-sandbox build [ENV] [--rebuild] [--pull]
 pi-sandbox env list
 pi-sandbox env show [ENV]
@@ -206,11 +209,57 @@ lean image that only installs packages listed in the manifest.
 Every generated image installs `pi` with:
 
 ```dockerfile
-RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
 ```
 
 Override that command with `pi_install` only when testing a different agent
-package or install source.
+package or install source. Headless option and basic framing behavior has been
+checked against 0.85.1; a custom install may use incompatible JSON/RPC records
+or options.
+
+## Programmatic workers
+
+`exec` runs pi without a terminal, emits schema-versioned JSONL on stdout, and
+writes durable artifacts to a fresh output directory. `rpc` forwards pi's
+native LF-delimited RPC protocol byte-for-byte on stdout. All launcher and
+worker diagnostics go to stderr. The output directory must be outside the
+mounted workspace and persistent home.
+
+```sh
+pi-sandbox exec --prompt-file /tmp/task.txt \
+  --output-dir /tmp/pi-runs/task-1 --timeout 900 \
+  -- --provider openai --model gpt-5
+
+printf '%s\n' '{"id":"state","type":"get_state"}' | \
+  pi-sandbox rpc --output-dir /tmp/pi-runs/review-1 --timeout 900
+```
+
+Exec envelopes contain `schema_version`, `type`, `run_id`, and a monotonically
+increasing `seq`. `pi_event` envelopes preserve the complete upstream event in
+`event`; the terminal `run_finished` envelope includes status and exit code.
+RPC stdout is not wrapped. A command-acceptance RPC response is not task
+completion, and the RPC process exit status does not summarize every prompt.
+
+Each run stores `run.json`, atomic `result.json`, `events.jsonl`, `stderr.log`,
+`response.txt` for exec, and an isolated `sessions/` directory. These files are
+mode 0700 at the directory boundary and can contain source, model output, or
+credentials echoed by tools. A resume source is cloned into the new run:
+
+```sh
+pi-sandbox exec --prompt-file /tmp/follow-up.txt \
+  --resume-session /tmp/pi-runs/task-1/sessions/session.jsonl \
+  --output-dir /tmp/pi-runs/task-2 --timeout 900
+```
+
+Supported pi passthrough options currently include provider, model, thinking,
+tools, extensions, and `--no-tools`. Launcher-owned mode, print, session,
+continue/resume, positional prompt, attachment, and unknown options are rejected
+fail-closed. Prompts are UTF-8, nonempty, limited to 8 MiB, and read once.
+Protocol records are limited to 32 MiB. `stop` checks both Docker context and
+the exact run ownership label before touching a container. A headless run takes
+an OS-backed exclusive lock for its canonical worktree; use distinct worktrees
+for parallel editing. `SIGKILL` and host crashes cannot guarantee cleanup, so
+retain the output directory and use `stop` to reconcile an orphan.
 
 Both `[env]` and the historically named `[runtime_env]` are image defaults:
 they are rendered into Dockerfile `ENV` instructions and affect the image tag.
