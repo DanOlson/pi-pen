@@ -1,6 +1,8 @@
 # Networked resources and parallel worktrees
 
-Status: implementation specification; no runtime changes implemented by this document.
+Status: original implementation specification. The feature is now implemented;
+see [validation and limits](implementation-validation.md) and the README for
+the delivered interface and the refinements made during review.
 Written September 19, 2026.
 
 ## Goal and agreed scope

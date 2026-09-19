@@ -1,7 +1,9 @@
 # Programmatic invocation and orchestration
 
-Status: proposed implementation specification; these commands are not yet
-implemented. Written September 19, 2026.
+Status: original implementation specification. See
+[validation and limits](implementation-validation.md) and the README for the
+delivered interface and the refinements made during review.
+Written September 19, 2026.
 
 ## Goal
 

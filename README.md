@@ -222,10 +222,12 @@ or options.
 `exec` runs pi without a terminal, emits schema-versioned JSONL on stdout, and
 writes durable artifacts to a fresh output directory. `rpc` forwards pi's
 native LF-delimited RPC protocol byte-for-byte on stdout. All launcher and
-worker diagnostics go to stderr. The output directory must be outside the
-mounted workspace and persistent home.
+worker diagnostics are streamed to stderr, with the durable diagnostic log in
+`stderr.log`. The output directory must be outside all worker mounts, including
+the workspace, persistent home, and shared Git metadata.
 
 ```sh
+mkdir -p /tmp/pi-runs
 pi-sandbox exec --prompt-file /tmp/task.txt \
   --output-dir /tmp/pi-runs/task-1 --timeout 900 \
   -- --provider openai --model gpt-5
@@ -241,9 +243,12 @@ RPC stdout is not wrapped. A command-acceptance RPC response is not task
 completion, and the RPC process exit status does not summarize every prompt.
 
 Each run stores `run.json`, atomic `result.json`, `events.jsonl`, `stderr.log`,
-`response.txt` for exec, and an isolated `sessions/` directory. These files are
-mode 0700 at the directory boundary and can contain source, model output, or
-credentials echoed by tools. A resume source is cloned into the new run:
+`response.txt` for exec, and an isolated `sessions/` directory. Directories are
+mode 0700 and artifact files are mode 0600; they can contain source, model output,
+or credentials echoed by tools. `result.json` includes session-file paths for
+explicit follow-up. Its optional `usage` is the final assistant message's
+reported usage, not a total across the whole conversation. A resume source is
+cloned into the new run:
 
 ```sh
 pi-sandbox exec --prompt-file /tmp/follow-up.txt \
@@ -255,8 +260,11 @@ Supported pi passthrough options currently include provider, model, thinking,
 tools, extensions, and `--no-tools`. Launcher-owned mode, print, session,
 continue/resume, positional prompt, attachment, and unknown options are rejected
 fail-closed. Prompts are UTF-8, nonempty, limited to 8 MiB, and read once.
-Protocol records are limited to 32 MiB. `stop` checks both Docker context and
-the exact run ownership label before touching a container. A headless run takes
+Protocol records are limited to 32 MiB. Consume stdout and stderr concurrently:
+a stdout write that makes no progress for one second fails the worker, allowing
+cleanup to proceed. If stderr cannot keep up, the durable log remains the
+authoritative diagnostic record. `stop` checks Docker context, endpoint, daemon
+identity, and the exact run ownership label before touching a container. A headless run takes
 an OS-backed exclusive lock for its canonical worktree; use distinct worktrees
 for parallel editing. `SIGKILL` and host crashes cannot guarantee cleanup, so
 retain the output directory and use `stop` to reconcile an orphan.
