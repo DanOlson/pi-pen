@@ -191,7 +191,6 @@ struct PreparedEnvironment {
 }
 
 pub fn run_cli(cli: Cli) -> Result<()> {
-    let signals = SignalState::install()?;
     match cli.command {
         Command::Build { env, rebuild, pull } => {
             let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
@@ -217,6 +216,8 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             pi_args,
             overrides,
         } => {
+            // Install before resolving credentials or creating their temporary file.
+            let signals = SignalState::install()?;
             let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
             let prepared = prepare_environment(&resolved, &cli.cwd)?;
             let launch = launch::resolve_run_config(&resolved, &cli.cwd, &overrides)?;
