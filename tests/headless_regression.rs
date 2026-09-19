@@ -2,6 +2,7 @@
 
 use serde_json::Value;
 use std::fs;
+use std::io::{BufRead, BufReader};
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -46,6 +47,7 @@ case "$1" in
     if [ "$TEST_CASE" = create-timeout ]; then sleep 3; fi
     printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
   start)
+    printf 'fixture worker diagnostic\n' >&2
     case "$TEST_CASE" in
       malformed) printf 'not-json\n'; exit 0 ;;
       empty-stream) exit 0 ;;
@@ -60,7 +62,8 @@ case "$1" in
     else
       printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"fixture result"}],"stopReason":"stop"}}'
     fi
-    printf '%s\n' '{"type":"agent_end","messages":[]}' ;;
+    printf '%s\n' '{"type":"agent_end","messages":[]}'
+    if [ "$TEST_CASE" = closed-output ]; then sleep 1; fi ;;
   inspect)
     case "$*" in
       *ExitCode*) printf '0\n' ;;
@@ -151,6 +154,7 @@ fn exec_without_tty_streams_only_json_and_persists_final_text() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
+    assert!(String::from_utf8_lossy(&output.stderr).contains("fixture worker diagnostic"));
     let events: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -166,6 +170,39 @@ fn exec_without_tty_streams_only_json_and_persists_final_text() {
         fs::read_to_string(fixture.output.join("response.txt")).unwrap(),
         "fixture result"
     );
+}
+
+#[test]
+fn closing_stdout_before_terminal_event_cannot_leave_success_artifact() {
+    let fixture = Fixture::new();
+    let mut child = fixture
+        .command("closed-output")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut reader = BufReader::new(child.stdout.take().unwrap());
+    loop {
+        let mut line = String::new();
+        assert!(
+            reader.read_line(&mut line).unwrap() > 0,
+            "worker ended before agent_end"
+        );
+        let event: Value = serde_json::from_str(&line).unwrap();
+        if event["event"]["type"] == "agent_end" {
+            break;
+        }
+    }
+    drop(reader);
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.result()["status"], "failed");
+    assert_eq!(fixture.result()["wrapper_exit_code"], 3);
 }
 
 #[test]
