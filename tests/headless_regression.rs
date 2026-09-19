@@ -38,8 +38,10 @@ case "$1" in
       inspect) printf 'unix:///test/docker.sock\n' ;;
     esac ;;
   image) exit 0 ;;
+  info) printf 'fixture-daemon-id\n' ;;
   network)
     if [ "$TEST_CASE" = missing-network ]; then exit 1; fi ;;
+  run) printf '0.85.1\n' ;;
   create)
     if [ "$TEST_CASE" = create-failure ]; then printf 'fixture create failure\n' >&2; exit 1; fi
     if [ "$TEST_CASE" = create-timeout ]; then sleep 3; fi
