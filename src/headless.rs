@@ -600,19 +600,8 @@ fn supervise(
     if let Some(error) = protocol_error {
         return Ok(("failed".into(), error, 1, status.code(), response));
     }
-    if mode == Mode::Exec {
-        seq += 1;
-        let outcome = if status.success() {
-            "completed"
-        } else {
-            "failed"
-        };
-        let envelope = json!({"schema_version":SCHEMA_VERSION,"type":"run_finished","run_id":record.run_id,"seq":seq,"status":outcome,"exit_code":status.code()});
-        write_json_line(&mut events, &envelope)?;
-        write_json_line(&mut io::stdout(), &envelope)?;
-    }
-    if mode == Mode::Exec && (!saw_agent_end || unrecovered_error) {
-        Ok((
+    let terminal = if mode == Mode::Exec && (!saw_agent_end || unrecovered_error) {
+        (
             "failed".into(),
             if unrecovered_error {
                 "agent_error"
@@ -623,18 +612,25 @@ fn supervise(
             1,
             status.code(),
             response,
-        ))
+        )
     } else if mode == Mode::Rpc && rpc_eof.is_some() {
-        Ok((
+        (
             "completed".into(),
             "connection_closed".into(),
             0,
             status.code(),
             response,
-        ))
+        )
     } else {
-        outcome(status, mode, response)
+        outcome(status, mode, response)?
+    };
+    if mode == Mode::Exec {
+        seq += 1;
+        let envelope = json!({"schema_version":SCHEMA_VERSION,"type":"run_finished","run_id":record.run_id,"seq":seq,"status":terminal.0,"exit_code":terminal.2});
+        write_json_line(&mut events, &envelope)?;
+        write_json_line(&mut io::stdout(), &envelope)?;
     }
+    Ok(terminal)
 }
 
 fn outcome(status: ExitStatus, mode: Mode, response: Option<String>) -> Result<Terminal> {
