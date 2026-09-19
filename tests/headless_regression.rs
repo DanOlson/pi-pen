@@ -34,7 +34,7 @@ printf '%s\n' "$*" >> "$TEST_DOCKER_LOG"
 case "$1" in
   context)
     case "$2" in
-      show) if [ "$TEST_CASE" = context-failure ]; then exit 1; fi; printf 'test-context\n' ;;
+      show) if [ "$TEST_CASE" = context-failure ]; then exit 1; fi; if [ "$TEST_CASE" = context-held-pipe ]; then sleep 30 & fi; printf 'test-context\n' ;;
       inspect) printf 'unix:///test/docker.sock\n' ;;
     esac ;;
   image) exit 0 ;;
@@ -43,6 +43,14 @@ case "$1" in
     if [ "$TEST_CASE" = missing-network ]; then exit 1; fi ;;
   run) printf '0.85.1\n' ;;
   create)
+    cidfile=''
+    previous=''
+    for argument in "$@"; do
+      if [ "$previous" = --cidfile ]; then cidfile="$argument"; fi
+      previous="$argument"
+    done
+    if [ -n "$cidfile" ]; then printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' > "$cidfile"; fi
+    if [ "$TEST_CASE" = create-overflow ]; then head -c 1100000 /dev/zero >&2; exit 0; fi
     if [ "$TEST_CASE" = create-failure ]; then printf 'fixture create failure\n' >&2; exit 1; fi
     if [ "$TEST_CASE" = create-timeout ]; then sleep 3; fi
     printf 'aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\n' ;;
@@ -375,4 +383,35 @@ fn context_failure_after_claim_has_terminal_artifacts() {
     let run: Value =
         serde_json::from_slice(&fs::read(fixture.output.join("run.json")).unwrap()).unwrap();
     assert_eq!(run["state"], "terminal");
+}
+
+#[test]
+fn create_output_failure_cleans_cidfile_container() {
+    let fixture = Fixture::new();
+    let output = bounded_output(fixture.command("create-overflow"));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.result()["wrapper_exit_code"], 3);
+    let log = fs::read_to_string(fixture.root.path().join("docker.log")).unwrap();
+    assert!(log.lines().any(|line| line.starts_with("rm -f ")), "{log}");
+}
+
+#[test]
+fn inherited_context_pipe_obeys_overall_timeout() {
+    let fixture = Fixture::new();
+    let started = Instant::now();
+    let output = bounded_output(fixture.command_with_timeout("context-held-pipe", "2"));
+    assert_eq!(
+        output.status.code(),
+        Some(124),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(started.elapsed() < Duration::from_secs(8));
+    assert_eq!(fixture.result()["wrapper_exit_code"], 124);
+    assert_eq!(fixture.result()["status"], "timed_out");
 }
