@@ -789,10 +789,7 @@ pub fn run_invocation(
 }
 
 pub fn persistent_home_dir(cwd: &Path, resolved: &ResolvedEnv) -> Result<PathBuf> {
-    let base = dirs::config_dir()
-        .context("could not determine user config directory")?
-        .join("pi-sandbox")
-        .join("homes");
+    let base = config_dir()?.join("homes");
     let mut input = cwd.display().to_string();
     input.push('\n');
     input.push_str(&source_fingerprint(&resolved.source));
@@ -979,12 +976,24 @@ fn write_resolved_dockerfile(cache: &Path, tag: &str, dockerfile: &str) -> Resul
 }
 
 fn cache_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("PI_SANDBOX_CACHE_DIR") {
+        return Ok(PathBuf::from(path));
+    }
     let base = dirs::cache_dir().context("could not determine user cache directory")?;
     Ok(base.join("pi-sandbox"))
 }
 
+fn config_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("PI_SANDBOX_CONFIG_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(dirs::config_dir()
+        .context("could not determine user config directory")?
+        .join("pi-sandbox"))
+}
+
 fn user_env_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("pi-sandbox").join("envs"))
+    config_dir().ok().map(|dir| dir.join("envs"))
 }
 
 fn user_env_path(name: &str) -> Option<PathBuf> {
