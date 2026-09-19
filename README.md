@@ -220,6 +220,9 @@ or options.
 
 ## Programmatic workers
 
+See the [programmatic usage guide](docs/programmatic-usage.md) for authentication,
+parallel worktrees, runnable orchestration and RPC examples, exit codes, and cancellation.
+
 `exec` runs pi without a terminal, emits schema-versioned JSONL on stdout, and
 writes durable artifacts to a fresh output directory. `rpc` forwards pi's
 native LF-delimited RPC protocol byte-for-byte on stdout. All launcher and
@@ -233,8 +236,8 @@ pi-sandbox exec --prompt-file /tmp/task.txt \
   --output-dir /tmp/pi-runs/task-1 --timeout 900 \
   -- --provider openai --model gpt-5
 
-printf '%s\n' '{"id":"state","type":"get_state"}' | \
-  pi-sandbox rpc --output-dir /tmp/pi-runs/review-1 --timeout 900
+# Keeps stdin open until the RPC response arrives:
+python3 examples/rpc_state.py --output-dir /tmp/pi-runs/review-1 --timeout 60
 ```
 
 Exec envelopes contain `schema_version`, `type`, `run_id`, and a monotonically

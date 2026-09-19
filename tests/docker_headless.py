@@ -18,6 +18,7 @@ import pathlib
 import shutil
 import stat
 import subprocess
+import sys
 import tempfile
 import time
 
@@ -142,6 +143,21 @@ pi_install = "printf '%s\\n' '#!/bin/sh' '[ \"$1\" = \"--version\" ] && { echo 0
         assert rpc.stdout == "", "RPC EOF must not synthesize protocol output"
         assert read_json(rpc_output / "result.json")["status"] == "completed"
         assert_private(rpc_output)
+
+        jobs_file = root / "jobs.json"
+        jobs_file.write_text(json.dumps([
+            {"name": f"worker-{i}", "worktree": str(worktree), "prompt": "normal batch task\n"}
+            for i, worktree in enumerate(worktrees)
+        ]), encoding="utf-8")
+        batch = root / "batch"
+        outputs.extend(batch / f"worker-{i}" for i in range(3))
+        example = run(sys.executable, ROOT / "examples/orchestrate.py",
+                      "--binary", BIN, "--manifest", fixture, "--jobs", jobs_file,
+                      "--output-root", batch, "--timeout", "30",
+                      env=env, capture_output=True, timeout=60)
+        summaries = [json.loads(line) for line in example.stdout.splitlines()]
+        assert len(summaries) == 3 and all(s["status"] == "completed" for s in summaries)
+        assert_private(batch)
 
         managed_after = run("docker", "ps", "-a", "--filter", "label=io.pi-sandbox.managed=true", "--format", "{{.ID}}", capture_output=True).stdout.splitlines()
         assert sorted(managed_after) == sorted(managed_before), f"test leaked managed containers: before={managed_before}, after={managed_after}"
