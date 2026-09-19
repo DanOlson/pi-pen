@@ -115,7 +115,8 @@ fn termination_removes_the_secret_launch_file() {
     fs::create_dir_all(&bin_dir).unwrap();
     fs::create_dir_all(&temp_dir).unwrap();
     let docker = bin_dir.join("docker");
-    fs::write(&docker, "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') exit 0;;\n  'run --rm') exec sleep 30;;\n  *) exit 0;;\nesac\n").unwrap();
+    let marker = dir.path().join("docker-terminated");
+    fs::write(&docker, "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') exit 0;;\n  'run --rm') trap 'touch \"$MARKER\"; exit 0' TERM INT HUP; while :; do sleep 1; done;;\n  *) exit 0;;\nesac\n").unwrap();
     fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
     fs::write(
         dir.path().join(".pi-env.toml"),
@@ -128,8 +129,9 @@ fn termination_removes_the_secret_launch_file() {
         .current_dir(dir.path())
         .env("PATH", path)
         .env("TMPDIR", &temp_dir)
-        .env("XDG_CONFIG_HOME", dir.path().join("config"))
-        .env("XDG_CACHE_HOME", dir.path().join("cache"))
+        .env("MARKER", &marker)
+        .env("PI_SANDBOX_CONFIG_DIR", dir.path().join("config"))
+        .env("PI_SANDBOX_CACHE_DIR", dir.path().join("cache"))
         .spawn()
         .unwrap();
     let mut appeared = false;
@@ -155,6 +157,7 @@ fn termination_removes_the_secret_launch_file() {
             .success()
     );
     let _ = child.wait().unwrap();
+    assert!(marker.exists(), "termination was not forwarded to Docker");
     assert!(!fs::read_dir(&temp_dir).unwrap().any(|entry| {
         entry
             .unwrap()

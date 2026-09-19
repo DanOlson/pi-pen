@@ -284,6 +284,9 @@ This lets the pi agent and other tools keep credentials/config between runs
 even though each container is recreated.
 
 The project itself is still mounted separately at `/workspace`.
+For hermetic automation, host-side `PI_SANDBOX_CONFIG_DIR` and
+`PI_SANDBOX_CACHE_DIR` override the normal platform locations. They are
+launcher controls and cannot be passed through as container variables.
 
 ## Networked services and launch environment
 
