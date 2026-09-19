@@ -967,8 +967,12 @@ fn write_resolved_dockerfile(cache: &Path, tag: &str, dockerfile: &str) -> Resul
     let dir = cache.join(tag);
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create cache dir {}", dir.display()))?;
-    fs::write(dir.join("Dockerfile"), dockerfile)
+    let path = dir.join("Dockerfile");
+    let temporary = dir.join(format!(".Dockerfile.{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temporary, dockerfile)
         .with_context(|| format!("failed to write resolved Dockerfile for {tag}"))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to publish resolved Dockerfile for {tag}"))?;
     Ok(())
 }
 
@@ -1055,10 +1059,20 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
 }
 
 fn run_process(invocation: DockerInvocation) -> Result<()> {
-    let status = ProcessCommand::new(&invocation.program)
+    let mut child = ProcessCommand::new(&invocation.program)
         .args(&invocation.args)
-        .status()
+        .stdout(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to run {}", invocation.program))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("failed to capture process stdout")?;
+    let drain = std::thread::spawn(move || io::copy(&mut stdout, &mut io::stderr()));
+    let status = child.wait().context("failed to wait for child process")?;
+    drain
+        .join()
+        .map_err(|_| anyhow::anyhow!("process output drain panicked"))??;
     if !status.success() {
         bail!("{} failed with status {status}", invocation.program);
     }

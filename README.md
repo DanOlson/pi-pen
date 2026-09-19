@@ -213,8 +213,9 @@ RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
 ```
 
 Override that command with `pi_install` only when testing a different agent
-package or install source. Headless protocol compatibility is tested against
-0.85.1; a custom install may use incompatible JSON/RPC records or options.
+package or install source. Headless option and basic framing behavior has been
+checked against 0.85.1; a custom install may use incompatible JSON/RPC records
+or options.
 
 ## Programmatic workers
 
