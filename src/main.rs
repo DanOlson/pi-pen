@@ -65,6 +65,8 @@ struct RunArgs {
     /// Always check for a newer base image while building.
     #[arg(long)]
     pull: bool,
+    #[command(flatten)]
+    launch: pi_sandbox::LaunchArgs,
     /// Arguments passed through to pi.
     #[arg(last = true)]
     pi_args: Vec<String>,
@@ -140,6 +142,7 @@ impl From<Cli> for pi_sandbox::Cli {
                     rebuild: args.rebuild,
                     pull: args.pull,
                     pi_args: args.pi_args,
+                    overrides: args.launch.into(),
                 },
             },
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
