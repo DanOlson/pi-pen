@@ -6,6 +6,12 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 
+pub mod launch;
+pub use launch::{
+    ContainerContext, HostAccess, LaunchArgs, LaunchEnvFile, ResolvedRunConfig, RunConfig,
+    RunContext, RunOverrides,
+};
+
 const PROJECT_MANIFEST: &str = ".pi-env.toml";
 const DEFAULT_BASE_IMAGE: &str = "node:22-bookworm";
 const DEFAULT_PI_INSTALL: &str = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent";
@@ -67,6 +73,7 @@ pub enum Command {
         rebuild: bool,
         pull: bool,
         pi_args: Vec<String>,
+        overrides: RunOverrides,
     },
 }
 
@@ -134,6 +141,8 @@ pub struct EnvManifest {
     pub git: Option<GitConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<DockerfileHooks>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -196,22 +205,40 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             rebuild,
             pull,
             pi_args,
+            overrides,
         } => {
             let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
-            let cache = cache_dir()?;
             let prepared = prepare_environment(&resolved, &cli.cwd)?;
-            build_images(&cache, &prepared.images, rebuild, pull)?;
+            let launch = launch::resolve_run_config(&resolved, &cli.cwd, &overrides)?;
             let tag = &prepared
                 .images
                 .last()
                 .context("resolved environment did not produce an image")?
                 .tag;
+            if overrides.dry_run {
+                launch::print_dry_run(tag, &launch);
+                return Ok(());
+            }
+            launch::preflight_networks(&launch)?;
+            let cache = cache_dir()?;
+            build_images(&cache, &prepared.images, rebuild, pull)?;
 
             let uid = command_output("id", &["-u"])?;
             let gid = command_output("id", &["-g"])?;
             let home = persistent_home_dir(&cli.cwd, &resolved)?;
             seed_git_config(&home, prepared.git.as_ref())?;
-            run_process_interactive(run_invocation(&cli.cwd, &home, tag, &uid, &gid, &pi_args))?;
+            let env_file = LaunchEnvFile::new(&launch)?;
+            let context = RunContext {
+                cwd: &cli.cwd,
+                home: &home,
+                image: tag,
+                uid: &uid,
+                gid: &gid,
+                pi_args: &pi_args,
+                interactive: true,
+                env_file: Some(env_file.path()),
+            };
+            run_process_interactive(launch::run_invocation(&context, &launch))?;
         }
     }
 
@@ -991,7 +1018,7 @@ fn image_tag(dockerfile: &str) -> String {
     format!("pi-sandbox-env:{hash:016x}")
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -1089,6 +1116,7 @@ mod tests {
                 prepend: Some("# syntax=docker/dockerfile:1".to_string()),
                 append: Some("RUN true".to_string()),
             }),
+            run: None,
         };
 
         let dockerfile = render_dockerfile(&manifest);
@@ -1509,6 +1537,24 @@ mod tests {
         assert_eq!(first_tag, second_tag);
         assert!(first_tag.starts_with("pi-sandbox-env:"));
         assert_eq!(first_tag.len(), "pi-sandbox-env:".len() + 16);
+    }
+
+    #[test]
+    fn launch_only_configuration_does_not_change_image() {
+        let plain = EnvManifest::default();
+        let configured = EnvManifest {
+            run: Some(RunConfig {
+                networks: Some(vec!["db".into()]),
+                env: BTreeMap::from([("SECRET".into(), "value".into())]),
+                ..Default::default()
+            }),
+            ..EnvManifest::default()
+        };
+        assert_eq!(render_dockerfile(&plain), render_dockerfile(&configured));
+        assert_eq!(
+            image_tag(&render_dockerfile(&plain)),
+            image_tag(&render_dockerfile(&configured))
+        );
     }
 
     #[test]
