@@ -80,6 +80,8 @@ struct RunArgs {
     /// Always check for a newer base image while building.
     #[arg(long)]
     pull: bool,
+    #[command(flatten)]
+    launch: pi_sandbox::LaunchArgs,
     /// Arguments passed through to pi.
     #[arg(last = true)]
     pi_args: Vec<String>,
@@ -93,6 +95,8 @@ struct ExecArgs {
     rebuild: bool,
     #[arg(long)]
     pull: bool,
+    #[command(flatten)]
+    launch: pi_sandbox::LaunchArgs,
     /// Read the assignment from this local file.
     #[arg(
         long,
@@ -124,6 +128,8 @@ struct RpcArgs {
     rebuild: bool,
     #[arg(long)]
     pull: bool,
+    #[command(flatten)]
+    launch: pi_sandbox::LaunchArgs,
     #[arg(long)]
     output_dir: PathBuf,
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
@@ -212,6 +218,7 @@ impl From<Cli> for pi_sandbox::Cli {
                     rebuild: args.rebuild,
                     pull: args.pull,
                     pi_args: args.pi_args,
+                    overrides: args.launch.into(),
                 },
                 Command::Exec(args) => pi_sandbox::Command::Headless(
                     pi_sandbox::headless::HeadlessCommand::Exec(pi_sandbox::headless::Options {
@@ -227,6 +234,7 @@ impl From<Cli> for pi_sandbox::Cli {
                             pi_sandbox::headless::Prompt::Stdin
                         }),
                         pi_args: args.pi_args,
+                        overrides: args.launch.into(),
                     }),
                 ),
                 Command::Rpc(args) => pi_sandbox::Command::Headless(
@@ -239,6 +247,7 @@ impl From<Cli> for pi_sandbox::Cli {
                         resume_session: args.resume_session,
                         prompt: None,
                         pi_args: args.pi_args,
+                        overrides: args.launch.into(),
                     }),
                 ),
                 Command::Stop(args) => {

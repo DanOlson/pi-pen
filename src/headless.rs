@@ -2,6 +2,7 @@ use super::{
     build_images, cache_dir, command_output, fnv1a64, persistent_home_dir, prepare_environment,
     resolve_env, seed_git_config,
 };
+use crate::{ContainerContext, LaunchEnvFile, RunOverrides};
 use anyhow::{Context, Result, bail};
 use fs2::FileExt;
 use serde::{Deserialize, Serialize};
@@ -49,6 +50,7 @@ pub struct Options {
     pub resume_session: Option<PathBuf>,
     pub prompt: Option<Prompt>,
     pub pi_args: Vec<String>,
+    pub overrides: RunOverrides,
 }
 
 #[derive(Debug)]
@@ -133,6 +135,19 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         .timeout
         .map(|seconds| Instant::now() + Duration::from_secs(seconds));
     let resume = prepare_resume_source(options.resume_session.as_deref())?;
+    let resolved = resolve_env(options.env.as_deref(), cwd)?;
+    let launch = crate::launch::resolve_run_config(&resolved, cwd, &options.overrides)?;
+    let prepared = prepare_environment(&resolved, cwd)?;
+    let tag = prepared
+        .images
+        .last()
+        .context("environment produced no image")?
+        .tag
+        .clone();
+    if options.overrides.dry_run {
+        crate::launch::print_dry_run(&tag, &launch);
+        return Ok(());
+    }
     let requested_output = if options.output_dir.is_absolute() {
         options.output_dir.clone()
     } else {
@@ -172,18 +187,11 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         fs::copy(source, output.join("sessions").join(name))
             .context("failed to clone resume session")?;
     }
-    let resolved = resolve_env(options.env.as_deref(), cwd)?;
     let cache = cache_dir()?;
-    let prepared = prepare_environment(&resolved, cwd)?;
     // Build output is diagnostics. Existing build helpers currently inherit stderr/stdout;
     // the reuse notice is deliberately stderr in machine mode.
     build_images(&cache, &prepared.images, options.rebuild, options.pull)?;
-    let tag = prepared
-        .images
-        .last()
-        .context("environment produced no image")?
-        .tag
-        .clone();
+    crate::launch::preflight_networks(&launch)?;
     record.image = Some(tag.clone());
     record.state = "starting".into();
     update_record(&output, &mut record)?;
@@ -194,9 +202,21 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
     seed_git_config(&home, prepared.git.as_ref())?;
     let uid = command_output("id", &["-u"])?;
     let gid = command_output("id", &["-g"])?;
-    let create_args = create_args(&CreateSpec { record: &record, cwd, home: &home,
-        output: &output, tag: &tag, uid: &uid, gid: &gid, mode,
-        passthrough: &options.pi_args, resume: resume.as_deref() });
+    let env_file = LaunchEnvFile::new(&launch)?;
+    let create_args = create_args(&CreateSpec {
+        record: &record,
+        cwd,
+        home: &home,
+        output: &output,
+        tag: &tag,
+        uid: &uid,
+        gid: &gid,
+        mode,
+        passthrough: &options.pi_args,
+        resume: resume.as_deref(),
+        launch: &launch,
+        env_file: env_file.path(),
+    });
     let container_id =
         docker_output_owned(&create_args).context("failed to create worker container")?;
     if container_id.is_empty() {
@@ -446,9 +466,20 @@ fn outcome(status: ExitStatus, mode: Mode, response: Option<String>) -> Result<T
     }
 }
 
-struct CreateSpec<'a> { record: &'a RunRecord, cwd: &'a Path, home: &'a Path,
-    output: &'a Path, tag: &'a str, uid: &'a str, gid: &'a str, mode: Mode,
-    passthrough: &'a [String], resume: Option<&'a Path> }
+struct CreateSpec<'a> {
+    record: &'a RunRecord,
+    cwd: &'a Path,
+    home: &'a Path,
+    output: &'a Path,
+    tag: &'a str,
+    uid: &'a str,
+    gid: &'a str,
+    mode: Mode,
+    passthrough: &'a [String],
+    resume: Option<&'a Path>,
+    launch: &'a crate::ResolvedRunConfig,
+    env_file: &'a Path,
+}
 fn create_args(spec: &CreateSpec<'_>) -> Vec<String> {
     let mut a = vec![
         "create".into(),
@@ -458,24 +489,26 @@ fn create_args(spec: &CreateSpec<'_>) -> Vec<String> {
         format!("io.pi-sandbox.run-id={}", spec.record.run_id),
         "--label".into(),
         "io.pi-sandbox.managed=true".into(),
-        "--user".into(),
-        format!("{}:{}", spec.uid, spec.gid),
-        "--env".into(),
-        "HOME=/tmp/pi-home".into(),
-        "--mount".into(),
-        format!("type=bind,src={},dst=/workspace", spec.cwd.display()),
-        "--mount".into(),
-        format!("type=bind,src={},dst=/tmp/pi-home", spec.home.display()),
+    ];
+    spec.launch.append_docker_create_args(
+        &mut a,
+        &ContainerContext {
+            cwd: spec.cwd,
+            home: spec.home,
+            uid: spec.uid,
+            gid: spec.gid,
+            env_file: Some(spec.env_file),
+        },
+    );
+    a.extend([
         "--mount".into(),
         format!(
             "type=bind,src={},dst=/tmp/pi-sessions",
             spec.output.join("sessions").display()
         ),
-        "--workdir".into(),
-        "/workspace".into(),
         spec.tag.into(),
         "pi".into(),
-    ];
+    ]);
     if spec.mode == Mode::Exec {
         a.extend(["--print".into(), "--mode".into(), "json".into()]);
     } else {
@@ -485,10 +518,10 @@ fn create_args(spec: &CreateSpec<'_>) -> Vec<String> {
     if let Some(source) = spec.resume
         && let Some(name) = source.file_name()
     {
-            a.extend([
-                "--session".into(),
-                format!("/tmp/pi-sessions/{}", name.to_string_lossy()),
-            ]);
+        a.extend([
+            "--session".into(),
+            format!("/tmp/pi-sessions/{}", name.to_string_lossy()),
+        ]);
     }
     a.extend(spec.passthrough.iter().cloned());
     a
