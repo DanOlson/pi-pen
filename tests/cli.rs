@@ -1,4 +1,6 @@
 use std::fs;
+#[cfg(unix)]
+use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 use tempfile::tempdir;
 
@@ -65,6 +67,104 @@ fn run_help_includes_image_refresh_controls() {
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert!(stdout.contains("--rebuild"));
     assert!(stdout.contains("--pull"));
+    assert!(stdout.contains("--network"));
+    assert!(stdout.contains("--default-network"));
+    assert!(stdout.contains("--host-access"));
+    assert!(stdout.contains("--env-file"));
+    assert!(stdout.contains("--namespace"));
+    assert!(stdout.contains("--dry-run"));
+}
+
+#[test]
+fn dry_run_redacts_values_and_does_not_need_docker() {
+    let dir = tempdir().unwrap();
+    fs::write(
+        dir.path().join(".pi-env.toml"),
+        "[run]\nnetworks=[\"missing-test-network\"]\n[run.env]\nSECRET=\"do-not-print\"\n",
+    )
+    .unwrap();
+    let output = Command::new(bin())
+        .args(["run", "--dry-run", "--env", "OTHER=also-secret"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("missing-test-network"));
+    assert!(stdout.contains("unverified"));
+    assert!(stdout.contains("SECRET=<redacted>"));
+    assert!(!stdout.contains("do-not-print"));
+    assert!(!stdout.contains("also-secret"));
+}
+
+#[test]
+fn default_network_conflicts_with_network() {
+    let output = Command::new(bin())
+        .args(["run", "--network", "one", "--default-network", "--dry-run"])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+}
+
+#[cfg(unix)]
+#[test]
+fn termination_removes_the_secret_launch_file() {
+    let dir = tempdir().unwrap();
+    let bin_dir = dir.path().join("bin");
+    let temp_dir = dir.path().join("tmp");
+    fs::create_dir_all(&bin_dir).unwrap();
+    fs::create_dir_all(&temp_dir).unwrap();
+    let docker = bin_dir.join("docker");
+    let marker = dir.path().join("docker-terminated");
+    fs::write(&docker, "#!/bin/sh\ncase \"$1 $2\" in\n  'image inspect') exit 0;;\n  'run --rm') trap 'touch \"$MARKER\"; exit 0' TERM INT HUP; while :; do sleep 1; done;;\n  *) exit 0;;\nesac\n").unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+    fs::write(
+        dir.path().join(".pi-env.toml"),
+        "[run.env]\nSECRET=\"distinctive-secret\"\n",
+    )
+    .unwrap();
+    let path = format!("{}:{}", bin_dir.display(), std::env::var("PATH").unwrap());
+    let mut child = Command::new(bin())
+        .arg("run")
+        .current_dir(dir.path())
+        .env("PATH", path)
+        .env("TMPDIR", &temp_dir)
+        .env("MARKER", &marker)
+        .env("PI_SANDBOX_CONFIG_DIR", dir.path().join("config"))
+        .env("PI_SANDBOX_CACHE_DIR", dir.path().join("cache"))
+        .spawn()
+        .unwrap();
+    let mut appeared = false;
+    for _ in 0..100 {
+        appeared = fs::read_dir(&temp_dir).unwrap().any(|entry| {
+            entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with("pi-sandbox-env-")
+        });
+        if appeared {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    assert!(appeared, "launch env file was not created");
+    assert!(
+        Command::new("kill")
+            .args(["-TERM", &child.id().to_string()])
+            .status()
+            .unwrap()
+            .success()
+    );
+    let _ = child.wait().unwrap();
+    assert!(marker.exists(), "termination was not forwarded to Docker");
+    assert!(!fs::read_dir(&temp_dir).unwrap().any(|entry| {
+        entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pi-sandbox-env-")
+    }));
 }
 
 #[test]

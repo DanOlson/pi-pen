@@ -39,7 +39,10 @@ cargo install --path . --force
 
 ```sh
 pi-sandbox init
-pi-sandbox run [ENV] [--rebuild] [--pull] [-- <pi args...>]
+pi-sandbox run [ENV] [--rebuild] [--pull] [network options] [-- <pi args...>]
+pi-sandbox exec [ENV] (--prompt-file PATH | --prompt-stdin) --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
+pi-sandbox rpc [ENV] --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
+pi-sandbox stop --output-dir PATH [--grace SECONDS]
 pi-sandbox build [ENV] [--rebuild] [--pull]
 pi-sandbox env list
 pi-sandbox env show [ENV]
@@ -206,16 +209,70 @@ lean image that only installs packages listed in the manifest.
 Every generated image installs `pi` with:
 
 ```dockerfile
-RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
 ```
 
 Override that command with `pi_install` only when testing a different agent
-package or install source.
+package or install source. Headless option and basic framing behavior has been
+checked against 0.85.1; a custom install may use incompatible JSON/RPC records
+or options.
 
-Use `[env]` for variables needed while building the image. Use `[runtime_env]`
-for variables only needed when the container runs, such as final `PATH` values;
-runtime env is rendered after install commands so edits are less likely to
-invalidate expensive Docker layers.
+## Programmatic workers
+
+`exec` runs pi without a terminal, emits schema-versioned JSONL on stdout, and
+writes durable artifacts to a fresh output directory. `rpc` forwards pi's
+native LF-delimited RPC protocol byte-for-byte on stdout. All launcher and
+worker diagnostics are streamed to stderr, with the durable diagnostic log in
+`stderr.log`. The output directory must be outside all worker mounts, including
+the workspace, persistent home, and shared Git metadata.
+
+```sh
+mkdir -p /tmp/pi-runs
+pi-sandbox exec --prompt-file /tmp/task.txt \
+  --output-dir /tmp/pi-runs/task-1 --timeout 900 \
+  -- --provider openai --model gpt-5
+
+printf '%s\n' '{"id":"state","type":"get_state"}' | \
+  pi-sandbox rpc --output-dir /tmp/pi-runs/review-1 --timeout 900
+```
+
+Exec envelopes contain `schema_version`, `type`, `run_id`, and a monotonically
+increasing `seq`. `pi_event` envelopes preserve the complete upstream event in
+`event`; the terminal `run_finished` envelope includes status and exit code.
+RPC stdout is not wrapped. A command-acceptance RPC response is not task
+completion, and the RPC process exit status does not summarize every prompt.
+
+Each run stores `run.json`, atomic `result.json`, `events.jsonl`, `stderr.log`,
+`response.txt` for exec, and an isolated `sessions/` directory. Directories are
+mode 0700 and artifact files are mode 0600; they can contain source, model output,
+or credentials echoed by tools. `result.json` includes session-file paths for
+explicit follow-up. Its optional `usage` is the final assistant message's
+reported usage, not a total across the whole conversation. A resume source is
+cloned into the new run:
+
+```sh
+pi-sandbox exec --prompt-file /tmp/follow-up.txt \
+  --resume-session /tmp/pi-runs/task-1/sessions/session.jsonl \
+  --output-dir /tmp/pi-runs/task-2 --timeout 900
+```
+
+Supported pi passthrough options currently include provider, model, thinking,
+tools, extensions, and `--no-tools`. Launcher-owned mode, print, session,
+continue/resume, positional prompt, attachment, and unknown options are rejected
+fail-closed. Prompts are UTF-8, nonempty, limited to 8 MiB, and read once.
+Protocol records are limited to 32 MiB. Consume stdout and stderr concurrently:
+a stdout write that makes no progress for one second fails the worker, allowing
+cleanup to proceed. If stderr cannot keep up, the durable log remains the
+authoritative diagnostic record. `stop` checks Docker context, endpoint, daemon
+identity, and the exact run ownership label before touching a container. A headless run takes
+an OS-backed exclusive lock for its canonical worktree; use distinct worktrees
+for parallel editing. `SIGKILL` and host crashes cannot guarantee cleanup, so
+retain the output directory and use `stop` to reconcile an orphan.
+
+Both `[env]` and the historically named `[runtime_env]` are image defaults:
+they are rendered into Dockerfile `ENV` instructions and affect the image tag.
+Do not put connection secrets in either section. Use `[run]` for launch-only
+settings and explicitly selected ignored env files for credentials.
 
 Use `[git]` to seed Git identity into the container's persistent home without
 mounting host Git, SSH, or GitHub CLI config. On `run`, these values are written
@@ -235,6 +292,81 @@ This lets the pi agent and other tools keep credentials/config between runs
 even though each container is recreated.
 
 The project itself is still mounted separately at `/workspace`.
+For hermetic automation, host-side `PI_SANDBOX_CONFIG_DIR` and
+`PI_SANDBOX_CACHE_DIR` override the normal platform locations. They are
+launcher controls and cannot be passed through as container variables.
+
+## Networked services and launch environment
+
+`pi-sandbox` can join existing user-defined Docker networks and pass
+launch-only application settings without rebuilding the environment image:
+
+```toml
+[run]
+networks = ["myapp_default"]
+host_access = "desktop"
+env_files = [".pi-session.env"]
+namespace = "worktree"
+
+[run.env]
+PGHOST = "postgres"
+PGDATABASE = "app_{{namespace}}"
+REDIS_URL = "redis://redis:6379/0"
+APP_REDIS_PREFIX = "app:{{namespace}}:"
+```
+
+The services and named networks must already exist. `pi-sandbox` validates
+networks but never creates, migrates, flushes, or deletes external resources.
+Repeat `--network NAME` to replace the configured network list, or use
+`--default-network` to clear it. Other launch controls are
+`--host-access default|desktop|gateway`, repeated `--env-file PATH`, repeated
+`--env KEY=VALUE`, `--namespace NAME`, and `--dry-run`. A dry run performs
+local resolution and validation only; it redacts every environment value and
+does not contact Docker or create the persistent home.
+
+Manifest launch settings inherit parent-first. Omitted lists inherit, while an
+explicit empty list clears. `[run.env]` maps merge with child values winning.
+Environment precedence is image defaults, manifest env files, merged
+`[run.env]`, CLI env files, then CLI `--env`. Manifest env-file paths are
+relative to the manifest declaring the selected list; CLI paths are relative
+to the invoking directory.
+
+Env files use a deliberately small literal grammar: UTF-8 `KEY=VALUE` lines,
+blank lines, and comments whose first non-whitespace character is `#`. Values
+retain spaces, quotes, `#`, dollar signs, and additional equals signs. This is
+not a shell or dotenv parser: `export`, bare keys, and multiline values are
+rejected. Values are moved to Docker through a short-lived mode-0600 file and
+are not placed in the Docker command arguments. Docker administrators can
+still inspect a running container's environment; this is not a secret store.
+
+Only `[run.env]` expands `{{namespace}}` and `{{worktree_id}}`. The default
+namespace is a stable identifier derived from the canonical Git worktree root.
+An explicit namespace must match `[a-z][a-z0-9_]{0,39}`. Namespaces are naming
+aids, not isolation: applications must select separate pre-created databases
+or implement prefixes themselves. A Redis prefix does not isolate admin
+commands, pub/sub, or frameworks that ignore it.
+
+On Docker Desktop, workstation services are reached at
+`host.docker.internal:<port>` with `host_access = "desktop"`. For native Linux,
+`gateway` adds `host.docker.internal:host-gateway`; the service must listen on
+an address reachable from the bridge and its firewall/authentication should be
+configured accordingly. The gateway is the Docker host, not necessarily its
+loopback interface. Docker Desktop on Linux should normally use `desktop`.
+Remote daemons, Windows, rootless networking, and alternative VM runtimes are
+not verified in this version. The implementation is tested with Docker Engine
+27.3.1; multiple networks are attached using repeated `--network` options.
+
+Inside a session, `localhost` means the session container. No URL rewriting or
+port publishing is performed. When diagnosing connectivity, distinguish DNS
+failure, connection refusal/timeout, and application authentication errors;
+network existence validation does not prove a database is reachable.
+
+When run inside a linked Git worktree, pi-sandbox mounts only that worktree and
+the repository's Git administrative directories, then supplies `GIT_DIR`,
+`GIT_COMMON_DIR`, and `GIT_WORK_TREE`. Git status, staging, and commits work,
+but shared repository metadata remains writable shared state. Creating/removing
+worktrees inside the container, submodules, and unusual external object stores
+are not supported by this first version.
 
 ## File Ownership
 

@@ -5,10 +5,24 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
+
+pub mod launch;
+pub use launch::{
+    ContainerContext, ContainerIdFile, HostAccess, LaunchArgs, LaunchEnvFile, ResolvedRunConfig,
+    RunConfig, RunContext, RunOverrides,
+};
 
 const PROJECT_MANIFEST: &str = ".pi-env.toml";
 const DEFAULT_BASE_IMAGE: &str = "node:22-bookworm";
-const DEFAULT_PI_INSTALL: &str = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent";
+const DEFAULT_PI_INSTALL: &str =
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1";
+
+pub mod headless;
 const DEFAULT_PACKAGES: &[&str] = &[
     "bash",
     "ca-certificates",
@@ -67,7 +81,9 @@ pub enum Command {
         rebuild: bool,
         pull: bool,
         pi_args: Vec<String>,
+        overrides: RunOverrides,
     },
+    Headless(headless::HeadlessCommand),
 }
 
 #[derive(Debug)]
@@ -134,6 +150,8 @@ pub struct EnvManifest {
     pub git: Option<GitConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dockerfile: Option<DockerfileHooks>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run: Option<RunConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, Default)]
@@ -196,22 +214,51 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             rebuild,
             pull,
             pi_args,
+            overrides,
         } => {
+            // Install before resolving credentials or creating their temporary file.
+            let signals = SignalState::install()?;
             let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
-            let cache = cache_dir()?;
             let prepared = prepare_environment(&resolved, &cli.cwd)?;
-            build_images(&cache, &prepared.images, rebuild, pull)?;
+            let launch = launch::resolve_run_config(&resolved, &cli.cwd, &overrides)?;
             let tag = &prepared
                 .images
                 .last()
                 .context("resolved environment did not produce an image")?
                 .tag;
+            if overrides.dry_run {
+                launch::print_dry_run(tag, &launch);
+                return Ok(());
+            }
+            launch::preflight_networks(&launch)?;
+            let cache = cache_dir()?;
+            build_images(&cache, &prepared.images, rebuild, pull)?;
 
             let uid = command_output("id", &["-u"])?;
             let gid = command_output("id", &["-g"])?;
             let home = persistent_home_dir(&cli.cwd, &resolved)?;
             seed_git_config(&home, prepared.git.as_ref())?;
-            run_process_interactive(run_invocation(&cli.cwd, &home, tag, &uid, &gid, &pi_args))?;
+            let env_file = LaunchEnvFile::new(&launch)?;
+            let cid_file = ContainerIdFile::new()?;
+            let context = RunContext {
+                cwd: &cli.cwd,
+                home: &home,
+                image: tag,
+                uid: &uid,
+                gid: &gid,
+                pi_args: &pi_args,
+                interactive: true,
+                env_file: Some(env_file.path()),
+                cid_file: Some(cid_file.path()),
+            };
+            run_process_interactive(
+                launch::run_invocation(&context, &launch),
+                &signals,
+                &cid_file,
+            )?;
+        }
+        Command::Headless(command) => {
+            headless::run(command, &cli.cwd)?;
         }
     }
 
@@ -676,7 +723,7 @@ pub fn build_invocation(cache: &Path, tag: &str, pull: bool) -> Result<DockerInv
 
 fn ensure_image(cache: &Path, tag: &str, rebuild: bool, pull: bool) -> Result<()> {
     if !rebuild && !pull && docker_image_exists(tag)? {
-        println!("Reusing image {tag}");
+        eprintln!("Reusing image {tag}");
         return Ok(());
     }
 
@@ -749,10 +796,7 @@ pub fn run_invocation(
 }
 
 pub fn persistent_home_dir(cwd: &Path, resolved: &ResolvedEnv) -> Result<PathBuf> {
-    let base = dirs::config_dir()
-        .context("could not determine user config directory")?
-        .join("pi-sandbox")
-        .join("homes");
+    let base = config_dir()?.join("homes");
     let mut input = cwd.display().to_string();
     input.push('\n');
     input.push_str(&source_fingerprint(&resolved.source));
@@ -933,18 +977,34 @@ fn write_resolved_dockerfile(cache: &Path, tag: &str, dockerfile: &str) -> Resul
     let dir = cache.join(tag);
     fs::create_dir_all(&dir)
         .with_context(|| format!("failed to create cache dir {}", dir.display()))?;
-    fs::write(dir.join("Dockerfile"), dockerfile)
+    let path = dir.join("Dockerfile");
+    let temporary = dir.join(format!(".Dockerfile.{}.tmp", uuid::Uuid::new_v4()));
+    fs::write(&temporary, dockerfile)
         .with_context(|| format!("failed to write resolved Dockerfile for {tag}"))?;
+    fs::rename(&temporary, &path)
+        .with_context(|| format!("failed to publish resolved Dockerfile for {tag}"))?;
     Ok(())
 }
 
 fn cache_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("PI_SANDBOX_CACHE_DIR") {
+        return Ok(PathBuf::from(path));
+    }
     let base = dirs::cache_dir().context("could not determine user cache directory")?;
     Ok(base.join("pi-sandbox"))
 }
 
+fn config_dir() -> Result<PathBuf> {
+    if let Some(path) = std::env::var_os("PI_SANDBOX_CONFIG_DIR") {
+        return Ok(PathBuf::from(path));
+    }
+    Ok(dirs::config_dir()
+        .context("could not determine user config directory")?
+        .join("pi-sandbox"))
+}
+
 fn user_env_dir() -> Option<PathBuf> {
-    dirs::config_dir().map(|dir| dir.join("pi-sandbox").join("envs"))
+    config_dir().ok().map(|dir| dir.join("envs"))
 }
 
 fn user_env_path(name: &str) -> Option<PathBuf> {
@@ -991,7 +1051,7 @@ fn image_tag(dockerfile: &str) -> String {
     format!("pi-sandbox-env:{hash:016x}")
 }
 
-fn fnv1a64(bytes: &[u8]) -> u64 {
+pub(crate) fn fnv1a64(bytes: &[u8]) -> u64 {
     let mut hash = 0xcbf29ce484222325_u64;
     for byte in bytes {
         hash ^= u64::from(*byte);
@@ -1021,24 +1081,101 @@ fn command_output(program: &str, args: &[&str]) -> Result<String> {
 }
 
 fn run_process(invocation: DockerInvocation) -> Result<()> {
-    let status = ProcessCommand::new(&invocation.program)
+    let mut child = ProcessCommand::new(&invocation.program)
         .args(&invocation.args)
-        .status()
+        .stdout(Stdio::piped())
+        .spawn()
         .with_context(|| format!("failed to run {}", invocation.program))?;
+    let mut stdout = child
+        .stdout
+        .take()
+        .context("failed to capture process stdout")?;
+    let drain = std::thread::spawn(move || io::copy(&mut stdout, &mut io::stderr()));
+    let status = child.wait().context("failed to wait for child process")?;
+    drain
+        .join()
+        .map_err(|_| anyhow::anyhow!("process output drain panicked"))??;
     if !status.success() {
         bail!("{} failed with status {status}", invocation.program);
     }
     Ok(())
 }
 
-fn run_process_interactive(invocation: DockerInvocation) -> Result<()> {
-    let status = ProcessCommand::new(&invocation.program)
+struct SignalState {
+    interrupt: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    hangup: Arc<AtomicBool>,
+}
+
+impl SignalState {
+    fn install() -> Result<Self> {
+        let state = Self {
+            interrupt: Arc::new(AtomicBool::new(false)),
+            terminate: Arc::new(AtomicBool::new(false)),
+            hangup: Arc::new(AtomicBool::new(false)),
+        };
+        #[cfg(unix)]
+        {
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&state.interrupt))?;
+            signal_hook::flag::register(
+                signal_hook::consts::SIGTERM,
+                Arc::clone(&state.terminate),
+            )?;
+            signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&state.hangup))?;
+        }
+        Ok(state)
+    }
+
+    fn take(&self) -> Option<i32> {
+        if self.interrupt.swap(false, Ordering::Relaxed) {
+            Some(libc::SIGINT)
+        } else if self.terminate.swap(false, Ordering::Relaxed) {
+            Some(libc::SIGTERM)
+        } else if self.hangup.swap(false, Ordering::Relaxed) {
+            Some(libc::SIGHUP)
+        } else {
+            None
+        }
+    }
+}
+
+fn run_process_interactive(
+    invocation: DockerInvocation,
+    signals: &SignalState,
+    cid_file: &ContainerIdFile,
+) -> Result<()> {
+    let mut child = ProcessCommand::new(&invocation.program)
         .args(&invocation.args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
+        .spawn()
         .with_context(|| format!("failed to run {}", invocation.program))?;
+    let mut forwarded_at = None;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed waiting for Docker")? {
+            break status;
+        }
+        if let Some(signal) = signals.take() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child.id() as i32, signal);
+            }
+            forwarded_at = Some(Instant::now());
+        }
+        if forwarded_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(5)) {
+            if let Some(id) = cid_file.id() {
+                let _ = ProcessCommand::new("docker")
+                    .args(["rm", "-f", &id])
+                    .status();
+            }
+            let _ = child.kill();
+            break child
+                .wait()
+                .context("failed waiting for terminated Docker")?;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     if !status.success() {
         bail!("{} failed with status {status}", invocation.program);
     }
@@ -1089,6 +1226,7 @@ mod tests {
                 prepend: Some("# syntax=docker/dockerfile:1".to_string()),
                 append: Some("RUN true".to_string()),
             }),
+            run: None,
         };
 
         let dockerfile = render_dockerfile(&manifest);
@@ -1509,6 +1647,24 @@ mod tests {
         assert_eq!(first_tag, second_tag);
         assert!(first_tag.starts_with("pi-sandbox-env:"));
         assert_eq!(first_tag.len(), "pi-sandbox-env:".len() + 16);
+    }
+
+    #[test]
+    fn launch_only_configuration_does_not_change_image() {
+        let plain = EnvManifest::default();
+        let configured = EnvManifest {
+            run: Some(RunConfig {
+                networks: Some(vec!["db".into()]),
+                env: BTreeMap::from([("SECRET".into(), "value".into())]),
+                ..Default::default()
+            }),
+            ..EnvManifest::default()
+        };
+        assert_eq!(render_dockerfile(&plain), render_dockerfile(&configured));
+        assert_eq!(
+            image_tag(&render_dockerfile(&plain)),
+            image_tag(&render_dockerfile(&configured))
+        );
     }
 
     #[test]
