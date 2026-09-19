@@ -34,7 +34,7 @@ printf '%s\n' "$*" >> "$TEST_DOCKER_LOG"
 case "$1" in
   context)
     case "$2" in
-      show) printf 'test-context\n' ;;
+      show) if [ "$TEST_CASE" = context-failure ]; then exit 1; fi; printf 'test-context\n' ;;
       inspect) printf 'unix:///test/docker.sock\n' ;;
     esac ;;
   image) exit 0 ;;
@@ -359,4 +359,20 @@ fn missing_network_is_checked_before_image_work() {
             .any(|line| line.starts_with("build ") || line.starts_with("image ")),
         "{log}"
     );
+}
+
+#[test]
+fn context_failure_after_claim_has_terminal_artifacts() {
+    let fixture = Fixture::new();
+    let output = bounded_output(fixture.command("context-failure"));
+    assert_eq!(
+        output.status.code(),
+        Some(3),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(fixture.result()["status"], "failed");
+    let run: Value =
+        serde_json::from_slice(&fs::read(fixture.output.join("run.json")).unwrap()).unwrap();
+    assert_eq!(run["state"], "terminal");
 }

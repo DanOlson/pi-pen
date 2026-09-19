@@ -265,27 +265,15 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
     if canonical_output.starts_with(&canonical_workspace) {
         bail!("output directory resolved inside the mounted workspace");
     }
+    if let Some(git) = &launch.git {
+        for writable in [&git.common_dir, &git.git_dir] {
+            let canonical = fs::canonicalize(writable).unwrap_or_else(|_| writable.clone());
+            if canonical_output.starts_with(canonical) {
+                bail!("claimed output directory resolved inside writable Git metadata mounts");
+            }
+        }
+    }
     let run_id = Uuid::new_v4();
-    let docker_context = Some(docker_capture_controlled(
-        &["context", "show"],
-        deadline,
-        &signal,
-    )?);
-    let docker_endpoint = Some(docker_capture_controlled(
-        &[
-            "context",
-            "inspect",
-            "--format",
-            "{{(index .Endpoints \"docker\").Host}}",
-        ],
-        deadline,
-        &signal,
-    )?);
-    let docker_daemon_id = Some(docker_capture_controlled(
-        &["info", "--format", "{{.ID}}"],
-        deadline,
-        &signal,
-    )?);
     let mut record = RunRecord {
         schema_version: SCHEMA_VERSION,
         run_id,
@@ -302,9 +290,9 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
             PI_VERSION.into()
         },
         container_id: None,
-        docker_context,
-        docker_endpoint,
-        docker_daemon_id,
+        docker_context: None,
+        docker_endpoint: None,
+        docker_daemon_id: None,
         pi_compatibility: Some(
             if custom_pi {
                 "unverified_custom"
@@ -324,6 +312,27 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         armed: true,
         classification: Arc::clone(&signal),
     };
+    record.docker_context = Some(docker_capture_controlled(
+        &["context", "show"],
+        deadline,
+        &signal,
+    )?);
+    record.docker_endpoint = Some(docker_capture_controlled(
+        &[
+            "context",
+            "inspect",
+            "--format",
+            "{{(index .Endpoints \"docker\").Host}}",
+        ],
+        deadline,
+        &signal,
+    )?);
+    record.docker_daemon_id = Some(docker_capture_controlled(
+        &["info", "--format", "{{.ID}}"],
+        deadline,
+        &signal,
+    )?);
+    update_record(&output, &mut record)?;
     fs::create_dir(output.join("sessions")).context("failed to create sessions directory")?;
     set_private_permissions(&output.join("sessions"))?;
     if let Some(source) = resume.as_deref() {
@@ -350,19 +359,23 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         &signal,
         &output.join("stderr.log"),
     )?;
-    if !custom_pi {
-        let actual = docker_capture_controlled(
-            &["run", "--rm", &tag, "pi", "--version"],
-            deadline,
-            &signal,
-        )?;
-        if !actual.contains(PI_VERSION) {
-            bail!("built image pi version `{actual}` does not match tested {PI_VERSION}");
-        }
-        record.pi_version = actual;
+    let actual =
+        docker_capture_controlled(&["run", "--rm", &tag, "pi", "--version"], deadline, &signal)?;
+    let observed = parse_pi_version(&actual);
+    record.pi_version = observed.clone().unwrap_or_else(|| "unknown".into());
+    if observed.as_deref() == Some(PI_VERSION) {
         record.pi_compatibility = Some("compatible".into());
+    } else if custom_pi {
+        record.pi_compatibility = Some("unverified_custom".into());
+    } else {
+        record.pi_compatibility = Some("version_mismatch".into());
         update_record(&output, &mut record)?;
+        bail!(
+            "built image pi version `{}` does not exactly match tested {PI_VERSION}",
+            record.pi_version
+        );
     }
+    update_record(&output, &mut record)?;
     record.image = Some(tag.clone());
     record.state = "starting".into();
     update_record(&output, &mut record)?;
@@ -480,6 +493,19 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         .into());
     }
     Ok(())
+}
+
+fn parse_pi_version(output: &str) -> Option<String> {
+    output
+        .split_whitespace()
+        .find(|token| {
+            let parts = token.split('.').collect::<Vec<_>>();
+            parts.len() == 3
+                && parts
+                    .iter()
+                    .all(|part| !part.is_empty() && part.chars().all(|c| c.is_ascii_digit()))
+        })
+        .map(str::to_owned)
 }
 
 type Terminal = (String, String, i32, Option<i32>, Option<String>);
@@ -1310,19 +1336,25 @@ fn stop(output_dir: &Path, grace: u64) -> Result<()> {
         .container_id
         .clone()
         .context("run has no container ID yet")?;
+    let stop_signal = AtomicUsize::new(0);
+    let stop_deadline = Some(Instant::now() + Duration::from_secs(grace.saturating_add(10)));
     if let Some(expected) = r.docker_context.as_deref() {
-        let actual = docker_output(&["context", "show"])?;
+        let actual = docker_capture_controlled(&["context", "show"], stop_deadline, &stop_signal)?;
         if actual != expected {
             bail!("Docker context changed from `{expected}` to `{actual}`; refusing cleanup");
         }
     }
     if let Some(expected) = r.docker_endpoint.as_deref() {
-        let actual = docker_output(&[
-            "context",
-            "inspect",
-            "--format",
-            "{{(index .Endpoints \"docker\").Host}}",
-        ])?;
+        let actual = docker_capture_controlled(
+            &[
+                "context",
+                "inspect",
+                "--format",
+                "{{(index .Endpoints \"docker\").Host}}",
+            ],
+            stop_deadline,
+            &stop_signal,
+        )?;
         if actual != expected {
             bail!("Docker endpoint changed; refusing cleanup");
         }
@@ -1353,16 +1385,21 @@ fn stop(output_dir: &Path, grace: u64) -> Result<()> {
 }
 
 fn stop_container(id: &str, grace: u64) {
-    let _ = Command::new("docker")
-        .args(["stop", "--time", &grace.to_string(), id])
-        .stdout(Stdio::null())
-        .status();
+    let _ = docker_status_bounded(
+        &["stop", "--time", &grace.to_string(), id],
+        Duration::from_secs(grace.saturating_add(5)),
+    );
 }
 fn inspect_exit(id: &str) -> Option<i32> {
-    docker_output(&["inspect", "--format", "{{.State.ExitCode}}", id])
-        .ok()?
-        .parse()
-        .ok()
+    let signal = AtomicUsize::new(0);
+    docker_capture_controlled(
+        &["inspect", "--format", "{{.State.ExitCode}}", id],
+        Some(Instant::now() + Duration::from_secs(5)),
+        &signal,
+    )
+    .ok()?
+    .parse()
+    .ok()
 }
 fn final_assistant_text(v: &Value) -> Option<String> {
     if v.get("type")?.as_str()? != "message_end" {
@@ -1458,17 +1495,12 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 fn docker_output(args: &[&str]) -> Result<String> {
-    let o = Command::new("docker")
-        .args(args)
-        .output()
-        .context("failed to run Docker")?;
-    if !o.status.success() {
-        bail!(
-            "Docker command failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8(o.stdout)?.trim().into())
+    let signal = AtomicUsize::new(0);
+    docker_capture_controlled(
+        args,
+        Some(Instant::now() + Duration::from_secs(15)),
+        &signal,
+    )
 }
 fn docker_create_controlled(
     args: &[String],
@@ -1537,9 +1569,13 @@ fn docker_capture_controlled(
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to run controlled Docker command")?;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
+    let stdout = child.stdout.take().context("Docker stdout unavailable")?;
+    let stderr = child.stderr.take().context("Docker stderr unavailable")?;
+    let out = thread::spawn(move || capture_bounded(stdout, 1024 * 1024));
+    let err = thread::spawn(move || capture_bounded(stderr, 1024 * 1024));
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         let code = signal.load(Ordering::Relaxed);
         if code != 0 || deadline.is_some_and(|d| Instant::now() >= d) {
@@ -1555,26 +1591,71 @@ fn docker_capture_controlled(
             .into());
         }
         thread::sleep(Duration::from_millis(25));
+    };
+    let (stdout, stdout_overflow) = out
+        .join()
+        .map_err(|_| anyhow::anyhow!("Docker stdout drain panicked"))??;
+    let (stderr, stderr_overflow) = err
+        .join()
+        .map_err(|_| anyhow::anyhow!("Docker stderr drain panicked"))??;
+    if stdout_overflow || stderr_overflow {
+        bail!("Docker command output exceeded 1 MiB");
     }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
+    if !status.success() {
         return Err(ExitError {
             code: 3,
             message: format!(
                 "Docker command failed: {}",
-                String::from_utf8_lossy(&output.stderr).trim()
+                String::from_utf8_lossy(&stderr).trim()
             ),
         }
         .into());
     }
-    Ok(String::from_utf8(output.stdout)?.trim().into())
+    Ok(String::from_utf8(stdout)?.trim().into())
+}
+
+fn capture_bounded(mut source: impl Read, limit: usize) -> io::Result<(Vec<u8>, bool)> {
+    let mut captured = Vec::new();
+    let mut overflow = false;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            return Ok((captured, overflow));
+        }
+        let remaining = limit.saturating_sub(captured.len());
+        let keep = remaining.min(count);
+        captured.extend_from_slice(&buffer[..keep]);
+        if keep < count {
+            overflow = true;
+        }
+    }
 }
 fn docker_status(args: &[&str]) -> bool {
-    Command::new("docker")
+    docker_status_bounded(args, Duration::from_secs(10))
+}
+
+fn docker_status_bounded(args: &[&str], timeout: Duration) -> bool {
+    let Ok(mut child) = Command::new("docker")
         .args(args)
         .stdout(Stdio::null())
-        .status()
-        .is_ok_and(|s| s.success())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return false;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) if Instant::now() < deadline => thread::sleep(Duration::from_millis(25)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return false;
+            }
+        }
+    }
 }
 
 fn docker_remove_idempotent(id: &str) -> bool {
