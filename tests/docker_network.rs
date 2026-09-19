@@ -58,25 +58,22 @@ fn variable(value: &str) -> ResolvedVariable {
 fn session_args(
     name: &str,
     networks: &[String],
+    cwd: &Path,
     home: &Path,
-    mut env: BTreeMap<String, ResolvedVariable>,
+    env: BTreeMap<String, ResolvedVariable>,
     command: &str,
-) -> (LaunchEnvFile, Vec<String>) {
-    env.insert(
-        "PI_SANDBOX_NAMESPACE".into(),
-        ResolvedVariable {
-            value: name.into(),
-            provenance: EnvProvenance::Injected,
-        },
-    );
-    let config = ResolvedRunConfig {
-        networks: networks.to_vec(),
-        host_access: HostAccess::Desktop,
-        namespace: name.into(),
-        worktree_id: format!("wt_{name}"),
-        env,
-        git: None,
+) -> (LaunchEnvFile, Vec<String>, String) {
+    let resolved = resolve_env(None, cwd).unwrap();
+    let overrides = RunOverrides {
+        networks: Some(networks.to_vec()),
+        host_access: Some(HostAccess::Desktop),
+        env: env
+            .into_iter()
+            .map(|(key, value)| (key, value.value))
+            .collect(),
+        ..Default::default()
     };
+    let config = pi_sandbox::launch::resolve_run_config(&resolved, cwd, &overrides).unwrap();
     let file = LaunchEnvFile::new(&config).unwrap();
     let mut args = vec![
         "run".into(),
@@ -89,7 +86,7 @@ fn session_args(
     config.append_docker_create_args(
         &mut args,
         &ContainerContext {
-            cwd: home,
+            cwd,
             home,
             uid: "0",
             gid: "0",
@@ -102,7 +99,8 @@ fn session_args(
         "-c".into(),
         command.into(),
     ]);
-    (file, args)
+    let namespace = config.namespace.clone();
+    (file, args, namespace)
 }
 
 #[test]
@@ -189,7 +187,53 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
             db.into(),
         ]);
     }
-    let dir = tempdir().unwrap();
+    let worktree_fixture = tempdir().unwrap();
+    let repo = worktree_fixture.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    docker_command(Command::new("git").args(["init", "-q"]).current_dir(&repo));
+    std::fs::write(repo.join("base"), "base\n").unwrap();
+    docker_command(Command::new("git").args(["add", "base"]).current_dir(&repo));
+    docker_command(
+        Command::new("git")
+            .args([
+                "-c",
+                "user.name=Test",
+                "-c",
+                "user.email=test@example.invalid",
+                "commit",
+                "-qm",
+                "base",
+            ])
+            .current_dir(&repo),
+    );
+    let wt_a = worktree_fixture.path().join("worktree-a");
+    let wt_b = worktree_fixture.path().join("worktree-b");
+    docker_command(
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "network-a",
+                wt_a.to_str().unwrap(),
+            ])
+            .current_dir(&repo),
+    );
+    docker_command(
+        Command::new("git")
+            .args([
+                "worktree",
+                "add",
+                "-q",
+                "-b",
+                "network-b",
+                wt_b.to_str().unwrap(),
+            ])
+            .current_dir(&repo),
+    );
+    let home_a = tempdir().unwrap();
+    let home_b = tempdir().unwrap();
     let command = "psql -h \"$PGHOST\" -U postgres -d \"$PGDATABASE\" -c \"create table if not exists records(v text); insert into records values ('$PI_SANDBOX_NAMESPACE');\" && psql -h \"$PGHOST\" -U postgres -d shared -c \"create table if not exists records(v text); insert into records values ('$PI_SANDBOX_NAMESPACE');\" && exec 3<>/dev/tcp/$REDIS_HOST/6379 && key=\"${APP_REDIS_PREFIX}seen\" && printf '*3\\r\\n$3\\r\\nSET\\r\\n$%s\\r\\n%s\\r\\n$1\\r\\n1\\r\\n' \"${#key}\" \"$key\" >&3 && IFS= read -r reply <&3 && test \"$reply\" = \"$(printf '+OK\\r')\" && exec sleep 30";
     let common = |db: &str, prefix: &str| {
         BTreeMap::from([
@@ -201,8 +245,22 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
         ])
     };
     let networks = vec![pg_network, redis_network];
-    let (_file_a, args_a) = session_args(&a, &networks, dir.path(), common("app_a", "a:"), command);
-    let (_file_b, args_b) = session_args(&b, &networks, dir.path(), common("app_b", "b:"), command);
+    let (_file_a, args_a, namespace_a) = session_args(
+        &a,
+        &networks,
+        &wt_a,
+        home_a.path(),
+        common("app_a", "a:"),
+        command,
+    );
+    let (_file_b, args_b, namespace_b) = session_args(
+        &b,
+        &networks,
+        &wt_b,
+        home_b.path(),
+        common("app_b", "b:"),
+        command,
+    );
     docker(&args_a);
     docker(&args_b);
     for _ in 0..60 {
@@ -260,7 +318,15 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
         ]),
         "true"
     );
-    for (db, expected) in [("app_a", &a), ("app_b", &b)] {
+    assert_ne!(namespace_a, namespace_b);
+    let relaunched = pi_sandbox::launch::resolve_run_config(
+        &resolve_env(None, &wt_a).unwrap(),
+        &wt_a,
+        &RunOverrides::default(),
+    )
+    .unwrap();
+    assert_eq!(relaunched.namespace, namespace_a);
+    for (db, expected) in [("app_a", &namespace_a), ("app_b", &namespace_b)] {
         let count = docker(&[
             "exec".into(),
             postgres.clone(),
