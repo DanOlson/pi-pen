@@ -60,7 +60,7 @@ pub struct LaunchArgs {
     /// Launch environment KEY=VALUE. May be repeated.
     #[arg(long = "env", value_parser = parse_cli_env)]
     pub env_vars: Vec<(String, String)>,
-    /// Resource namespace, or `worktree`.
+    /// Runtime namespace for shared home state and resource templates, or `worktree`.
     #[arg(long)]
     pub namespace: Option<String>,
     /// Resolve launch details without Docker or filesystem mutations.

@@ -12,8 +12,10 @@ implemented interface; the implementation plans are design history.
   Workers using the same build configuration reuse its image.
 - Explicitly supply provider credentials. Exporting an API key in the host shell
   does **not** automatically forward it into the container. Use a private,
-  Git-ignored env file, or authentication configured in that worktree's persistent
-  container home. Do not assume a new worktree inherits another worktree's login.
+  Git-ignored env file, or use the same explicit namespace for an interactive
+  authentication run and every worker so linked worktrees share the namespace's
+  persistent container home. The default `worktree` namespace keeps logins
+  separate.
 
 For example, a file `/absolute/private/provider.env` can contain:
 
@@ -77,7 +79,8 @@ Run the example from this repository (or use its absolute script path):
 python3 examples/orchestrate.py \
   --jobs /tmp/jobs.json --output-root /tmp/pi-runs/batch-001 \
   --manifest /absolute/path/.pi-env.toml \
-  --env-file /absolute/private/provider.env --timeout 900 \
+  --env-file /absolute/private/provider.env \
+  --namespace batch_shared --timeout 900 \
   -- --provider openai --model gpt-5
 ```
 
@@ -85,6 +88,13 @@ Worktree paths are relative to the jobs file unless absolute. Other paths are
 relative to the invoking shell. `--binary /absolute/path/to/pi-sandbox` selects a
 local build. Omit `--manifest` to use normal manifest discovery in each worktree.
 The batch root must not already exist; its parent must exist.
+
+A named namespace also selects a persistent home shared by linked worktrees in
+the same repository and environment. Initialize provider authentication or
+home-installed dependencies once with `pi-sandbox run --namespace batch_shared`,
+then give the example the same namespace. Because that home includes mutable
+package caches and install locations, complete dependency provisioning before
+parallel work and serialize package-manager writes to shared state.
 
 The example launches all jobs concurrently, redirects each worker's stdout and
 stderr to separate private files, and prints one JSON summary per job afterward.

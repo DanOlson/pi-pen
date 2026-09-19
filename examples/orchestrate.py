@@ -19,6 +19,7 @@ def main():
     parser.add_argument("--binary", default="pi-sandbox")
     parser.add_argument("--manifest", type=pathlib.Path)
     parser.add_argument("--env-file", type=pathlib.Path)
+    parser.add_argument("--namespace")
     parser.add_argument("--timeout", type=int, default=900)
     parser.add_argument("pi_args", nargs=argparse.REMAINDER)
     args = parser.parse_args()
@@ -57,6 +58,8 @@ def main():
     common = []
     if args.env_file:
         common += ["--env-file", str(args.env_file.resolve())]
+    if args.namespace:
+        common += ["--namespace", args.namespace]
     passthrough = args.pi_args
     if passthrough[:1] == ["--"]:
         passthrough = passthrough[1:]

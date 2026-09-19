@@ -1,7 +1,7 @@
 use super::{
-    PreparedImage, build_invocation, cache_dir, command_output, fnv1a64, persistent_home_dir,
-    prepare_environment, resolve_env, resolve_parent_env, seed_git_config,
-    write_resolved_dockerfile,
+    PreparedImage, build_invocation, cache_dir, command_output, fnv1a64,
+    persistent_home_dir_for_run, prepare_environment, resolve_env, resolve_parent_env,
+    seed_git_config, write_resolved_dockerfile,
 };
 use crate::{ContainerContext, LaunchEnvFile, RunOverrides};
 use anyhow::{Context, Result, bail};
@@ -249,7 +249,7 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
             }
         }
     }
-    let home = persistent_home_dir(cwd, &resolved)?;
+    let home = persistent_home_dir_for_run(cwd, &resolved, &launch)?;
     if prospective_output.starts_with(fs::canonicalize(&home).unwrap_or_else(|_| home.clone())) {
         bail!("output directory must be outside the mounted persistent home");
     }

@@ -42,6 +42,11 @@ enum Command {
     Rpc(RpcArgs),
     /// Stop the exact managed container recorded in an output directory.
     Stop(StopArgs),
+    /// Install agent skills for using pi-sandbox programmatically.
+    Skills {
+        #[command(subcommand)]
+        command: SkillsCommand,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -68,6 +73,28 @@ enum EnvCommand {
     List,
     /// Show the resolved Dockerfile for an environment.
     Show(EnvArg),
+}
+
+#[derive(Debug, Subcommand)]
+enum SkillsCommand {
+    /// Install the bundled pi-sandbox skill into a project.
+    Install(SkillsInstallArgs),
+}
+
+#[derive(Debug, Args)]
+struct SkillsInstallArgs {
+    /// Installation root; defaults to the current Git worktree root.
+    #[arg(long)]
+    project_dir: Option<PathBuf>,
+    /// Overwrite modified or unrecognized bundled skill files.
+    #[arg(long)]
+    force: bool,
+    /// Create .claude/skills/pi-sandbox as a relative symlink.
+    #[arg(long, conflicts_with = "no_link_claude")]
+    link_claude: bool,
+    /// Do not prompt to create the Claude skill symlink.
+    #[arg(long, conflicts_with = "link_claude")]
+    no_link_claude: bool,
 }
 
 #[derive(Debug, Args)]
@@ -256,6 +283,18 @@ impl From<Cli> for pi_sandbox::Cli {
                         grace: args.grace,
                     })
                 }
+                Command::Skills { command } => pi_sandbox::Command::Skills {
+                    command: match command {
+                        SkillsCommand::Install(args) => {
+                            pi_sandbox::SkillsCommand::Install(pi_sandbox::skills::InstallOptions {
+                                project_dir: args.project_dir,
+                                force: args.force,
+                                link_claude: args.link_claude,
+                                no_link_claude: args.no_link_claude,
+                            })
+                        }
+                    },
+                },
             },
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }

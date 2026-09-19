@@ -46,6 +46,7 @@ pi-sandbox stop --output-dir PATH [--grace SECONDS]
 pi-sandbox build [ENV] [--rebuild] [--pull]
 pi-sandbox env list
 pi-sandbox env show [ENV]
+pi-sandbox skills install [--project-dir PATH] [--link-claude | --no-link-claude] [--force]
 ```
 
 `ENV` can be a manifest path, a repo-local manifest name, or a user-library
@@ -53,6 +54,34 @@ environment name.
 
 Use `pi-sandbox --help`, `pi-sandbox -h`, or `<command> --help` for command
 usage.
+
+## Agent Skill
+
+Install the bundled skill that teaches coding agents how to use `pi-sandbox`
+programmatically and orchestrate isolated investigation, test-first
+implementation, review, and revision sessions:
+
+```sh
+pi-sandbox skills install
+```
+
+The command finds the current Git worktree root and writes the skill to
+`.agents/skills/pi-sandbox`. Pass `--project-dir PATH` to choose an explicit
+root, including a directory that is not a Git worktree. Existing managed files
+are updated only when they are unchanged; use `--force` to replace modified or
+unrecognized bundled files.
+
+In an interactive terminal, the installer offers to create
+`.claude/skills/pi-sandbox` as a relative symlink to the canonical installation.
+For scripts and noninteractive agents, choose explicitly:
+
+```sh
+pi-sandbox skills install --link-claude
+pi-sandbox skills install --no-link-claude
+```
+
+The installer never replaces an existing Claude skill directory or a different
+symlink automatically.
 
 ## Init Wizard
 
@@ -290,10 +319,20 @@ to `/tmp/pi-home/.gitconfig`.
 
 ## Persistent Home
 
-`pi-sandbox run` creates a per-project persistent home directory under the
-platform config directory, then mounts it at `/tmp/pi-home` in the container.
-This lets the pi agent and other tools keep credentials/config between runs
-even though each container is recreated.
+`pi-sandbox run` creates a persistent home directory under the platform config
+directory, then mounts it at `/tmp/pi-home` in the container. The default
+`worktree` namespace keeps a separate home for each linked worktree. An explicit
+namespace selects a home shared by linked worktrees in the same repository and
+environment, allowing credentials, home-installed dependencies, caches, and
+tool configuration to persist across orchestrated workers:
+
+```sh
+pi-sandbox run --namespace batch_shared
+pi-sandbox exec --namespace batch_shared --prompt-file /tmp/task.txt --output-dir /tmp/run-1
+```
+
+Provision shared dependencies before parallel work and serialize concurrent
+package-manager writes to the shared home.
 
 The project itself is still mounted separately at `/workspace`.
 For hermetic automation, host-side `PI_SANDBOX_CONFIG_DIR` and
@@ -345,10 +384,12 @@ still inspect a running container's environment; this is not a secret store.
 
 Only `[run.env]` expands `{{namespace}}` and `{{worktree_id}}`. The default
 namespace is a stable identifier derived from the canonical Git worktree root.
-An explicit namespace must match `[a-z][a-z0-9_]{0,39}`. Namespaces are naming
-aids, not isolation: applications must select separate pre-created databases
-or implement prefixes themselves. A Redis prefix does not isolate admin
-commands, pub/sub, or frameworks that ignore it.
+An explicit namespace must match `[a-z][a-z0-9_]{0,39}` and also selects shared
+persistent home state for linked worktrees in the same repository and
+environment. Resource namespace values are naming aids, not enforced service
+isolation: applications must select separate pre-created databases or implement
+prefixes themselves. A Redis prefix does not isolate admin commands, pub/sub,
+or frameworks that ignore it.
 
 On Docker Desktop, workstation services are reached at
 `host.docker.internal:<port>` with `host_access = "desktop"`. For native Linux,

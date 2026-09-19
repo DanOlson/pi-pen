@@ -23,6 +23,7 @@ const DEFAULT_PI_INSTALL: &str =
     "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1";
 
 pub mod headless;
+pub mod skills;
 const DEFAULT_PACKAGES: &[&str] = &[
     "bash",
     "ca-certificates",
@@ -85,12 +86,20 @@ pub enum Command {
         overrides: RunOverrides,
     },
     Headless(headless::HeadlessCommand),
+    Skills {
+        command: SkillsCommand,
+    },
 }
 
 #[derive(Debug)]
 pub enum EnvCommand {
     List,
     Show { env: Option<String> },
+}
+
+#[derive(Debug)]
+pub enum SkillsCommand {
+    Install(skills::InstallOptions),
 }
 
 #[derive(Debug)]
@@ -237,7 +246,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
 
             let uid = command_output("id", &["-u"])?;
             let gid = command_output("id", &["-g"])?;
-            let home = persistent_home_dir(&cli.cwd, &resolved)?;
+            let home = persistent_home_dir_for_run(&cli.cwd, &resolved, &launch)?;
             seed_git_config(&home, prepared.git.as_ref())?;
             let env_file = LaunchEnvFile::new(&launch)?;
             let cid_file = ContainerIdFile::new()?;
@@ -261,6 +270,9 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         Command::Headless(command) => {
             headless::run(command, &cli.cwd)?;
         }
+        Command::Skills { command } => match command {
+            SkillsCommand::Install(options) => skills::install(&cli.cwd, options)?,
+        },
     }
 
     Ok(())
@@ -805,6 +817,58 @@ pub fn persistent_home_dir(cwd: &Path, resolved: &ResolvedEnv) -> Result<PathBuf
     input.push_str(resolved.manifest.name.as_deref().unwrap_or("default"));
 
     let name = format!("{}-{:x}", project_slug(cwd), fnv1a64(input.as_bytes()));
+    let path = base.join(name);
+    fs::create_dir_all(&path)
+        .with_context(|| format!("failed to create persistent home {}", path.display()))?;
+    Ok(path)
+}
+
+pub fn persistent_home_dir_for_run(
+    cwd: &Path,
+    resolved: &ResolvedEnv,
+    launch: &ResolvedRunConfig,
+) -> Result<PathBuf> {
+    if launch.namespace == launch.worktree_id {
+        return persistent_home_dir(cwd, resolved);
+    }
+
+    let base = config_dir()?.join("homes");
+    namespace_home_dir(&base, cwd, resolved, launch)
+}
+
+fn namespace_home_dir(
+    base: &Path,
+    cwd: &Path,
+    resolved: &ResolvedEnv,
+    launch: &ResolvedRunConfig,
+) -> Result<PathBuf> {
+    let repository_identity = launch
+        .git
+        .as_ref()
+        .map(|git| git.common_dir.as_path())
+        .unwrap_or(cwd);
+    let repository_identity =
+        fs::canonicalize(repository_identity).unwrap_or_else(|_| repository_identity.to_path_buf());
+    let repository_root = if repository_identity
+        .file_name()
+        .is_some_and(|name| name == ".git")
+    {
+        repository_identity.parent().unwrap_or(&repository_identity)
+    } else {
+        &repository_identity
+    };
+    let mut input = repository_identity.display().to_string();
+    input.push('\n');
+    input.push_str(resolved.manifest.name.as_deref().unwrap_or("default"));
+    input.push('\n');
+    input.push_str(&launch.namespace);
+
+    let name = format!(
+        "{}-{}-{:x}",
+        project_slug(repository_root),
+        launch.namespace,
+        fnv1a64(input.as_bytes())
+    );
     let path = base.join(name);
     fs::create_dir_all(&path)
         .with_context(|| format!("failed to create persistent home {}", path.display()))?;
@@ -1548,6 +1612,78 @@ mod tests {
 
         assert_eq!(resolved.manifest.name.as_deref(), Some("default"));
         assert!(matches!(resolved.source, EnvSource::BuiltIn));
+    }
+
+    #[test]
+    fn named_namespace_shares_home_across_linked_worktrees() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("homes");
+        let repository = dir.path().join("repo");
+        let common = repository.join(".git");
+        let first_worktree = dir.path().join("first");
+        let second_worktree = dir.path().join("second");
+        fs::create_dir_all(&common).unwrap();
+        fs::create_dir_all(&first_worktree).unwrap();
+        fs::create_dir_all(&second_worktree).unwrap();
+
+        let resolved = ResolvedEnv {
+            source: EnvSource::Project(first_worktree.join(PROJECT_MANIFEST)),
+            manifest: EnvManifest {
+                name: Some("app".into()),
+                ..EnvManifest::default()
+            },
+        };
+        let config = |worktree: &Path, worktree_id: &str, namespace: &str| ResolvedRunConfig {
+            networks: Vec::new(),
+            host_access: HostAccess::Default,
+            namespace: namespace.into(),
+            worktree_id: worktree_id.into(),
+            env: BTreeMap::new(),
+            git: Some(launch::GitMounts {
+                worktree_root: worktree.to_path_buf(),
+                workspace_cwd: PathBuf::new(),
+                git_dir: common.clone(),
+                common_dir: common.clone(),
+                separate_git_dir: true,
+            }),
+        };
+
+        let first = namespace_home_dir(
+            &base,
+            &first_worktree,
+            &resolved,
+            &config(&first_worktree, "wt_first", "orchestration"),
+        )
+        .unwrap();
+        let second = namespace_home_dir(
+            &base,
+            &second_worktree,
+            &resolved,
+            &config(&second_worktree, "wt_second", "orchestration"),
+        )
+        .unwrap();
+        let explicitly_selected = namespace_home_dir(
+            &base,
+            &second_worktree,
+            &ResolvedEnv {
+                source: EnvSource::Explicit(repository.join(".pi-env.toml")),
+                manifest: resolved.manifest.clone(),
+            },
+            &config(&second_worktree, "wt_second", "orchestration"),
+        )
+        .unwrap();
+        let isolated = namespace_home_dir(
+            &base,
+            &second_worktree,
+            &resolved,
+            &config(&second_worktree, "wt_second", "other"),
+        )
+        .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(first, explicitly_selected);
+        assert_ne!(first, isolated);
+        assert!(first.is_dir());
     }
 
     #[test]

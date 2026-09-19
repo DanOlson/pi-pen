@@ -1,5 +1,6 @@
 """Stdlib regression tests for the runnable examples; no Docker or credentials."""
 import json
+import importlib.util
 import os
 from pathlib import Path
 import signal
@@ -10,11 +11,18 @@ import time
 import unittest
 
 ROOT = Path(__file__).resolve().parents[1]
+SKILL_RUNNER_PATH = ROOT / 'bundled-skills/pi-sandbox/assets/orchestrator.py'
+SKILL_RUNNER_SPEC = importlib.util.spec_from_file_location('skill_orchestrator',
+                                                           SKILL_RUNNER_PATH)
+SKILL_RUNNER = importlib.util.module_from_spec(SKILL_RUNNER_SPEC)
+sys.modules[SKILL_RUNNER_SPEC.name] = SKILL_RUNNER
+SKILL_RUNNER_SPEC.loader.exec_module(SKILL_RUNNER)
 FAKE = '''#!/usr/bin/env python3
 import json, pathlib, signal, sys, time
 args = sys.argv
 out = pathlib.Path(args[args.index('--output-dir') + 1])
 out.mkdir()
+(out / 'args.json').write_text(json.dumps(args))
 if args[1] == 'rpc':
     command = json.loads(input())
     print(json.dumps({'type':'response','id':command['id'],'success':True}), flush=True)
@@ -59,14 +67,17 @@ class ExamplesTest(unittest.TestCase):
         for i, worktree in enumerate(self.worktrees):
             git('worktree', 'add', '-qb', f'worker-{i}', str(worktree))
 
-    def command(self, prompts):
+    def command(self, prompts, namespace=None):
         jobs = [{'name':str(i), 'worktree':str(w), 'prompt':p}
                 for i, (w, p) in enumerate(zip(self.worktrees, prompts))]
         path = self.root / 'jobs.json'
         path.write_text(json.dumps(jobs))
-        return [sys.executable, str(ROOT / 'examples/orchestrate.py'),
-                '--binary', str(self.binary), '--jobs', str(path),
-                '--output-root', str(self.root / 'batch')]
+        command = [sys.executable, str(ROOT / 'examples/orchestrate.py'),
+                   '--binary', str(self.binary), '--jobs', str(path),
+                   '--output-root', str(self.root / 'batch')]
+        if namespace:
+            command += ['--namespace', namespace]
+        return command
 
     def test_parallel_large_streams_and_private_files(self):
         result = subprocess.run(self.command(['ok'] * 3), capture_output=True,
@@ -100,6 +111,14 @@ class ExamplesTest(unittest.TestCase):
         self.assertEqual(summary['status'], 'missing_result')
         self.assertEqual(summary['exit_code'], 2)
 
+    def test_namespace_is_forwarded_to_every_worker(self):
+        result = subprocess.run(self.command(['ok', 'ok'], namespace='shared_home'),
+                                capture_output=True, text=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for i in range(2):
+            args = json.loads((self.root / f'batch/{i}/args.json').read_text())
+            self.assertEqual(args[args.index('--namespace') + 1], 'shared_home')
+
     def test_cancellation(self):
         process = subprocess.Popen(self.command(['slow'] * 3), stdout=subprocess.PIPE,
                                    stderr=subprocess.PIPE, text=True)
@@ -126,6 +145,25 @@ class ExamplesTest(unittest.TestCase):
                                 text=True, capture_output=True, timeout=10)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(json.loads(result.stdout)['success'])
+
+    def test_bundled_skill_runner_executes_and_collects_a_worker(self):
+        env_file = self.root / 'worker.env'
+        env_file.write_text('TOKEN=secret\n')
+        outcome = SKILL_RUNNER.run_worker(
+            SKILL_RUNNER.Worker('skill-worker', self.worktrees[0], 'ok'),
+            output_root=self.root / 'skill-run', binary=str(self.binary), timeout=10,
+            env_files=[env_file], runtime_env={'APP_ENV': 'test'},
+            namespace='shared_home')
+
+        self.assertTrue(outcome.completed)
+        self.assertEqual(outcome.status, 'completed')
+        args = json.loads((outcome.output_dir / 'args.json').read_text())
+        self.assertEqual(args[args.index('--env-file') + 1], str(env_file))
+        self.assertEqual(args[args.index('--env') + 1], 'APP_ENV=test')
+        self.assertEqual(args[args.index('--namespace') + 1], 'shared_home')
+        self.assertGreater((self.root / 'skill-run/skill-worker.stdout.jsonl').stat().st_size,
+                           1000000)
+        self.assertTrue((self.root / 'skill-run/skill-worker.launcher.log').is_file())
 
 
 if __name__ == '__main__':

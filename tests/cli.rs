@@ -44,6 +44,157 @@ fn subcommand_help_flag_prints_usage() {
 }
 
 #[test]
+fn skills_install_help_documents_noninteractive_controls() {
+    let output = Command::new(bin())
+        .args(["skills", "install", "--help"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(stdout.contains("Usage: pi-sandbox skills install"));
+    assert!(stdout.contains("--project-dir"));
+    assert!(stdout.contains("--link-claude"));
+    assert!(stdout.contains("--no-link-claude"));
+    assert!(stdout.contains("--force"));
+}
+
+#[test]
+fn skills_install_writes_bundle_and_is_idempotent() {
+    let dir = tempdir().unwrap();
+    let command = || {
+        let mut command = Command::new(bin());
+        command.args([
+            "skills",
+            "install",
+            "--project-dir",
+            dir.path().to_str().unwrap(),
+            "--no-link-claude",
+        ]);
+        command
+    };
+
+    let first = command().output().unwrap();
+    assert!(
+        first.status.success(),
+        "{}",
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let skill = dir.path().join(".agents/skills/pi-sandbox");
+    let text = fs::read_to_string(skill.join("SKILL.md")).unwrap();
+    assert!(text.contains("test-first implementation"));
+    assert!(text.contains("commit the tested change"));
+    assert!(skill.join("assets/orchestrator.py").is_file());
+    assert!(skill.join("references/orchestration.md").is_file());
+    assert!(skill.join(".pi-sandbox-skill.json").is_file());
+
+    let second = command().output().unwrap();
+    assert!(second.status.success());
+    assert!(
+        String::from_utf8(second.stdout)
+            .unwrap()
+            .contains("Skill is current")
+    );
+}
+
+#[test]
+fn skills_install_defaults_to_git_worktree_root() {
+    let dir = tempdir().unwrap();
+    assert!(
+        Command::new("git")
+            .args(["init", "-q"])
+            .current_dir(dir.path())
+            .status()
+            .unwrap()
+            .success()
+    );
+    let nested = dir.path().join("one/two");
+    fs::create_dir_all(&nested).unwrap();
+
+    let output = Command::new(bin())
+        .args(["skills", "install", "--no-link-claude"])
+        .current_dir(&nested)
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        dir.path()
+            .join(".agents/skills/pi-sandbox/SKILL.md")
+            .is_file()
+    );
+    assert!(!nested.join(".agents").exists());
+}
+
+#[cfg(unix)]
+#[test]
+fn skills_install_can_link_claude_without_prompting() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args([
+            "skills",
+            "install",
+            "--project-dir",
+            dir.path().to_str().unwrap(),
+            "--link-claude",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        fs::read_link(dir.path().join(".claude/skills/pi-sandbox")).unwrap(),
+        std::path::Path::new("../../.agents/skills/pi-sandbox")
+    );
+}
+
+#[test]
+fn skills_install_protects_modified_managed_files() {
+    let dir = tempdir().unwrap();
+    let args = [
+        "skills",
+        "install",
+        "--project-dir",
+        dir.path().to_str().unwrap(),
+        "--no-link-claude",
+    ];
+    assert!(
+        Command::new(bin())
+            .args(args)
+            .output()
+            .unwrap()
+            .status
+            .success()
+    );
+    let skill = dir.path().join(".agents/skills/pi-sandbox/SKILL.md");
+    fs::write(&skill, "user edit").unwrap();
+
+    let protected = Command::new(bin()).args(args).output().unwrap();
+    assert!(!protected.status.success());
+    assert!(
+        String::from_utf8(protected.stderr)
+            .unwrap()
+            .contains("was modified")
+    );
+
+    let forced = Command::new(bin())
+        .args(args)
+        .arg("--force")
+        .output()
+        .unwrap();
+    assert!(forced.status.success());
+    assert!(fs::read_to_string(skill).unwrap().contains("# Pi Sandbox"));
+}
+
+#[test]
 fn build_help_includes_image_refresh_controls() {
     let output = Command::new(bin())
         .args(["build", "--help"])
