@@ -141,6 +141,7 @@ pub struct RunContext<'a> {
     pub pi_args: &'a [String],
     pub interactive: bool,
     pub env_file: Option<&'a Path>,
+    pub cid_file: Option<&'a Path>,
 }
 
 /// Runtime paths and identity needed to render Docker container flags.
@@ -156,6 +157,36 @@ pub struct ContainerContext<'a> {
 /// Owns a mode-0600 temporary file understood by `docker --env-file`.
 /// The file is automatically unlinked when this value is dropped.
 pub struct LaunchEnvFile(NamedTempFile);
+
+pub struct ContainerIdFile(PathBuf);
+
+impl ContainerIdFile {
+    pub fn new() -> Result<Self> {
+        let file = tempfile::Builder::new()
+            .prefix("pi-sandbox-cid-")
+            .tempfile()
+            .context("failed to reserve container id path")?;
+        let path = file.path().to_path_buf();
+        file.close()
+            .context("failed to prepare container id path")?;
+        Ok(Self(path))
+    }
+    pub fn path(&self) -> &Path {
+        &self.0
+    }
+    pub fn id(&self) -> Option<String> {
+        fs::read_to_string(&self.0)
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+}
+
+impl Drop for ContainerIdFile {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.0);
+    }
+}
 
 impl LaunchEnvFile {
     pub fn new(config: &ResolvedRunConfig) -> Result<Self> {
@@ -526,6 +557,9 @@ pub fn run_invocation(context: &RunContext<'_>, config: &ResolvedRunConfig) -> D
     if context.interactive {
         args.push("-it".into());
     }
+    if let Some(path) = context.cid_file {
+        args.extend(["--cidfile".into(), path.display().to_string()]);
+    }
     config.append_docker_create_args(
         &mut args,
         &ContainerContext {
@@ -658,7 +692,14 @@ pub fn print_dry_run(image: &str, config: &ResolvedRunConfig) {
             "git common mount: {} -> /tmp/pi-git",
             git.common_dir.display()
         );
+        if git.separate_git_dir {
+            println!(
+                "git worktree mount: {} -> /tmp/pi-git-worktree",
+                git.git_dir.display()
+            );
+        }
     }
+    println!("persistent home mount: <created on real run> -> /tmp/pi-home");
     println!("environment (values redacted):");
     for (key, variable) in &config.env {
         println!("  {key}=<redacted> ({:?})", variable.provenance);
