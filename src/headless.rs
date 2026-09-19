@@ -1,6 +1,6 @@
 use super::{
-    build_images, cache_dir, command_output, fnv1a64, persistent_home_dir, prepare_environment,
-    resolve_env, seed_git_config,
+    PreparedImage, build_invocation, cache_dir, command_output, fnv1a64, persistent_home_dir,
+    prepare_environment, resolve_env, seed_git_config, write_resolved_dockerfile,
 };
 use crate::{ContainerContext, LaunchEnvFile, RunOverrides};
 use anyhow::{Context, Result, bail};
@@ -12,6 +12,10 @@ use std::io::{self, BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Stdio};
 use std::sync::mpsc;
+use std::sync::{
+    Arc,
+    atomic::{AtomicUsize, Ordering},
+};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
@@ -73,6 +77,7 @@ struct RunRecord {
     pi_version: String,
     container_id: Option<String>,
     docker_context: Option<String>,
+    docker_endpoint: Option<String>,
     cancellation_requested: bool,
     resume_source: Option<PathBuf>,
 }
@@ -89,6 +94,48 @@ struct ResultRecord {
     finished_at_unix_ms: u128,
     response_available: bool,
     usage: Option<Value>,
+    image: Option<String>,
+    pi_version: String,
+    container_id: Option<String>,
+    cleanup_succeeded: Option<bool>,
+}
+
+struct FailureGuard {
+    output: PathBuf,
+    run_id: Uuid,
+    started: u128,
+    armed: bool,
+}
+impl Drop for FailureGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        if let Ok(bytes) = fs::read(self.output.join("run.json"))
+            && let Ok(mut record) = serde_json::from_slice::<RunRecord>(&bytes)
+        {
+            record.state = "terminal".into();
+            record.updated_at_unix_ms = now_ms();
+            let _ = write_json_atomic(&self.output.join("run.json"), &record);
+        }
+        let result = ResultRecord {
+            schema_version: SCHEMA_VERSION,
+            run_id: self.run_id,
+            status: "failed".into(),
+            reason: "launcher_error".into(),
+            wrapper_exit_code: 3,
+            container_exit_code: None,
+            started_at_unix_ms: self.started,
+            finished_at_unix_ms: now_ms(),
+            response_available: false,
+            usage: None,
+            image: None,
+            pi_version: PI_VERSION.into(),
+            container_id: None,
+            cleanup_succeeded: None,
+        };
+        let _ = write_json_atomic(&self.output.join("result.json"), &result);
+    }
 }
 
 pub fn run(command: HeadlessCommand, cwd: &Path) -> Result<()> {
@@ -126,6 +173,9 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         None
     };
     validate_pi_args(&options.pi_args)?;
+    let signal = Arc::new(AtomicUsize::new(0));
+    signal_hook::flag::register_usize(signal_hook::consts::SIGINT, Arc::clone(&signal), 130)?;
+    signal_hook::flag::register_usize(signal_hook::consts::SIGTERM, Arc::clone(&signal), 143)?;
     if let Some(seconds) = options.timeout
         && seconds == 0
     {
@@ -153,15 +203,38 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
     } else {
         cwd.join(&options.output_dir)
     };
-    let canonical_cwd = fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf());
-    if requested_output.starts_with(&canonical_cwd) {
+    let workspace = launch
+        .git
+        .as_ref()
+        .map(|g| g.worktree_root.as_path())
+        .unwrap_or(cwd);
+    let canonical_workspace =
+        fs::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    let prospective_output = canonicalize_prospective(&requested_output)?;
+    if prospective_output.starts_with(&canonical_workspace) {
         bail!("output directory must be outside the mounted workspace");
     }
+    if let Some(config) = dirs::config_dir() {
+        let homes = config.join("pi-sandbox").join("homes");
+        if prospective_output.starts_with(canonicalize_prospective(&homes)?) {
+            bail!("output directory must be outside the mounted persistent home");
+        }
+    }
+    let _worktree_lock = lock_worktree(workspace)?;
     let output = claim_output(&options.output_dir, cwd)?;
     let canonical_output = fs::canonicalize(&output)?;
-    let _worktree_lock = lock_worktree(cwd)?;
+    if canonical_output.starts_with(&canonical_workspace) {
+        bail!("output directory resolved inside the mounted workspace");
+    }
     let run_id = Uuid::new_v4();
     let docker_context = docker_output(&["context", "show"]).ok();
+    let docker_endpoint = docker_output(&[
+        "context",
+        "inspect",
+        "--format",
+        "{{(index .Endpoints \"docker\").Host}}",
+    ])
+    .ok();
     let mut record = RunRecord {
         schema_version: SCHEMA_VERSION,
         run_id,
@@ -175,22 +248,38 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         pi_version: PI_VERSION.into(),
         container_id: None,
         docker_context,
+        docker_endpoint,
         cancellation_requested: false,
         resume_source: resume.clone(),
     };
     write_json_atomic(&output.join("run.json"), &record)?;
+    let mut failure_guard = FailureGuard {
+        output: output.clone(),
+        run_id,
+        started,
+        armed: true,
+    };
     fs::create_dir(output.join("sessions")).context("failed to create sessions directory")?;
+    set_private_permissions(&output.join("sessions"))?;
     if let Some(source) = resume.as_deref() {
         let name = source
             .file_name()
             .context("resume session has no filename")?;
-        fs::copy(source, output.join("sessions").join(name))
-            .context("failed to clone resume session")?;
+        let cloned = output.join("sessions").join(name);
+        fs::copy(source, &cloned).context("failed to clone resume session")?;
+        set_private_file_permissions(&cloned)?;
     }
     let cache = cache_dir()?;
     // Build output is diagnostics. Existing build helpers currently inherit stderr/stdout;
     // the reuse notice is deliberately stderr in machine mode.
-    build_images(&cache, &prepared.images, options.rebuild, options.pull)?;
+    build_images_controlled(
+        &cache,
+        &prepared.images,
+        options.rebuild,
+        options.pull,
+        deadline,
+        &signal,
+    )?;
     crate::launch::preflight_networks(&launch)?;
     record.image = Some(tag.clone());
     record.state = "starting".into();
@@ -217,16 +306,24 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         launch: &launch,
         env_file: env_file.path(),
     });
-    let container_id =
-        docker_output_owned(&create_args).context("failed to create worker container")?;
+    let container_id = docker_create_controlled(&create_args, deadline, &signal)
+        .context("failed to create worker container")?;
     if container_id.is_empty() {
         bail!("docker create returned an empty container ID");
     }
     record.container_id = Some(container_id.clone());
     update_record(&output, &mut record)?;
-    let terminal = supervise(&output, &container_id, mode, prompt, deadline, &mut record);
+    let terminal = supervise(
+        &output,
+        &container_id,
+        mode,
+        prompt,
+        deadline,
+        &mut record,
+        &signal,
+    );
     let cleanup = docker_status(&["rm", "-f", &container_id]);
-    let (status, reason, wrapper, raw, response) = match terminal {
+    let (mut status, mut reason, mut wrapper, raw, response) = match terminal {
         Ok(v) => v,
         Err(e) => (
             "failed".into(),
@@ -236,6 +333,11 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
             None,
         ),
     };
+    if !cleanup && wrapper == 0 {
+        status = "failed".into();
+        reason = "cleanup_failed".into();
+        wrapper = 3;
+    }
     record.state = "terminal".into();
     let _ = update_record(&output, &mut record);
     if let Some(text) = response.as_deref() {
@@ -254,8 +356,13 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         finished_at_unix_ms: now_ms(),
         response_available: response.is_some(),
         usage: None,
+        image: Some(tag),
+        pi_version: PI_VERSION.into(),
+        container_id: Some(container_id.clone()),
+        cleanup_succeeded: Some(cleanup),
     };
     write_json_atomic(&output.join("result.json"), &result)?;
+    failure_guard.armed = false;
     if !cleanup {
         eprintln!("warning: failed to remove owned container {container_id}");
     }
@@ -281,6 +388,7 @@ fn supervise(
     prompt: Option<Vec<u8>>,
     deadline: Option<Instant>,
     record: &mut RunRecord,
+    signal: &AtomicUsize,
 ) -> Result<Terminal> {
     let mut child = Command::new("docker")
         .args(["start", "-a", "-i", id])
@@ -295,6 +403,11 @@ fn supervise(
     let stdout = child.stdout.take().context("docker stdout unavailable")?;
     let stderr = child.stderr.take().context("docker stderr unavailable")?;
     let stderr_path = output.join("stderr.log");
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&stderr_path)?;
+    set_private_file_permissions(&stderr_path)?;
     let stderr_thread = thread::spawn(move || -> io::Result<()> {
         let mut source = stderr;
         let mut log = OpenOptions::new()
@@ -313,6 +426,7 @@ fn supervise(
         }
         Ok(())
     });
+    let (eof_tx, eof_rx) = mpsc::channel();
     if mode == Mode::Exec {
         child_in
             .write_all(prompt.as_deref().unwrap_or_default())
@@ -322,6 +436,8 @@ fn supervise(
     } else {
         thread::spawn(move || {
             let _ = io::copy(&mut io::stdin().lock(), &mut child_in);
+            drop(child_in);
+            let _ = eof_tx.send(());
         });
     }
     let events_path = output.join("events.jsonl");
@@ -360,11 +476,15 @@ fn supervise(
     });
     let mut seq = 0u64;
     let mut response = None;
+    let mut saw_agent_end = false;
+    let mut unrecovered_error = false;
     let mut protocol_error = None;
+    let mut rpc_eof = None;
     let mut events = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&events_path)?;
+    set_private_file_permissions(&events_path)?;
     if mode == Mode::Exec {
         seq += 1;
         let envelope = json!({"schema_version":SCHEMA_VERSION,"type":"run_started","run_id":record.run_id,"seq":seq});
@@ -372,6 +492,30 @@ fn supervise(
         write_json_line(&mut io::stdout(), &envelope)?;
     }
     loop {
+        let signal_code = signal.load(Ordering::Relaxed);
+        if signal_code != 0 {
+            record.state = "stopping".into();
+            let _ = update_record(output, record);
+            stop_container(id, 10);
+            let status = child.wait()?;
+            return Ok((
+                "cancelled".into(),
+                format!("signal_{}", signal_code - 128),
+                signal_code as i32,
+                status.code(),
+                response,
+            ));
+        }
+        if mode == Mode::Rpc && rpc_eof.is_none() && eof_rx.try_recv().is_ok() {
+            rpc_eof = Some(Instant::now());
+        }
+        if rpc_eof.is_some_and(|at| at.elapsed() >= Duration::from_millis(250))
+            && child.try_wait()?.is_none()
+        {
+            record.state = "stopping".into();
+            let _ = update_record(output, record);
+            stop_container(id, 10);
+        }
         if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
             record.state = "stopping".into();
             let _ = update_record(output, record);
@@ -391,6 +535,11 @@ fn supervise(
                     events.write_all(line.as_bytes())?;
                     io::stdout().write_all(line.as_bytes())?;
                 } else {
+                    if !line.ends_with('\n') {
+                        protocol_error = Some("unterminated pi JSON record".into());
+                        stop_container(id, 1);
+                        break;
+                    }
                     let event: Value = match serde_json::from_str(line.trim_end()) {
                         Ok(v @ Value::Object(_)) => v,
                         _ => {
@@ -399,6 +548,18 @@ fn supervise(
                             break;
                         }
                     };
+                    if event.get("type").and_then(Value::as_str) == Some("agent_end") {
+                        saw_agent_end = true;
+                    }
+                    if event.get("type").and_then(Value::as_str) == Some("message_end")
+                        && event
+                            .get("message")
+                            .and_then(|m| m.get("stopReason"))
+                            .and_then(Value::as_str)
+                            .is_some_and(|r| matches!(r, "error" | "aborted"))
+                    {
+                        unrecovered_error = true;
+                    }
                     if let Some(text) = final_assistant_text(&event) {
                         response = Some(text);
                     }
@@ -424,6 +585,18 @@ fn supervise(
     }
     let status = child.wait()?;
     let _ = stderr_thread.join();
+    if let Ok(bytes) = fs::read(output.join("run.json"))
+        && let Ok(latest) = serde_json::from_slice::<RunRecord>(&bytes)
+        && latest.cancellation_requested
+    {
+        return Ok((
+            "cancelled".into(),
+            "explicit_stop".into(),
+            130,
+            status.code(),
+            response,
+        ));
+    }
     if let Some(error) = protocol_error {
         return Ok(("failed".into(), error, 1, status.code(), response));
     }
@@ -438,7 +611,30 @@ fn supervise(
         write_json_line(&mut events, &envelope)?;
         write_json_line(&mut io::stdout(), &envelope)?;
     }
-    outcome(status, mode, response)
+    if mode == Mode::Exec && (!saw_agent_end || unrecovered_error) {
+        Ok((
+            "failed".into(),
+            if unrecovered_error {
+                "agent_error"
+            } else {
+                "incomplete_event_stream"
+            }
+            .into(),
+            1,
+            status.code(),
+            response,
+        ))
+    } else if mode == Mode::Rpc && rpc_eof.is_some() {
+        Ok((
+            "completed".into(),
+            "connection_closed".into(),
+            0,
+            status.code(),
+            response,
+        ))
+    } else {
+        outcome(status, mode, response)
+    }
 }
 
 fn outcome(status: ExitStatus, mode: Mode, response: Option<String>) -> Result<Terminal> {
@@ -636,11 +832,13 @@ fn claim_output(path: &Path, cwd: &Path) -> Result<PathBuf> {
             .with_context(|| format!("failed to claim output directory {}", path.display()))?;
     }
     set_private_permissions(&path)?;
-    OpenOptions::new()
+    let claim = OpenOptions::new()
         .write(true)
         .create_new(true)
         .open(path.join(".claim"))
         .context("output directory is already claimed")?;
+    set_private_file_permissions(&path.join(".claim"))?;
+    drop(claim);
     Ok(path)
 }
 
@@ -661,6 +859,138 @@ fn lock_worktree(cwd: &Path) -> Result<File> {
     Ok(file)
 }
 
+fn build_images_controlled(
+    cache: &Path,
+    images: &[PreparedImage],
+    rebuild: bool,
+    pull: bool,
+    deadline: Option<Instant>,
+    signal: &AtomicUsize,
+) -> Result<()> {
+    for (index, image) in images.iter().enumerate() {
+        let lock_path = std::env::temp_dir().join(format!(
+            "pi-sandbox-image-{}.lock",
+            image.tag.replace(':', "-")
+        ));
+        let lock = OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .read(true)
+            .write(true)
+            .open(lock_path)?;
+        loop {
+            match lock.try_lock_exclusive() {
+                Ok(()) => break,
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    let signal_code = signal.load(Ordering::Relaxed);
+                    if signal_code != 0 {
+                        return Err(ExitError {
+                            code: signal_code as i32,
+                            message: "cancelled waiting for image lock".into(),
+                        }
+                        .into());
+                    }
+                    if deadline.is_some_and(|d| Instant::now() >= d) {
+                        return Err(ExitError {
+                            code: 124,
+                            message: "timed out waiting for image lock".into(),
+                        }
+                        .into());
+                    }
+                    thread::sleep(Duration::from_millis(25));
+                }
+                Err(error) => return Err(error.into()),
+            }
+        }
+        write_resolved_dockerfile(cache, &image.tag, &image.dockerfile)?;
+        if !rebuild && !pull && docker_image_exists_controlled(&image.tag, deadline, signal)? {
+            eprintln!("Reusing image {}", image.tag);
+            continue;
+        }
+        let invocation = build_invocation(cache, &image.tag, pull && index == 0)?;
+        let mut child = Command::new(invocation.program)
+            .args(invocation.args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .context("failed to start Docker build")?;
+        let mut stdout = child.stdout.take().context("build stdout unavailable")?;
+        let mut stderr = child.stderr.take().context("build stderr unavailable")?;
+        let out = thread::spawn(move || io::copy(&mut stdout, &mut io::stderr()));
+        let err = thread::spawn(move || io::copy(&mut stderr, &mut io::stderr()));
+        let status = loop {
+            if let Some(status) = child.try_wait()? {
+                break status;
+            }
+            if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out.join();
+                let _ = err.join();
+                return Err(ExitError {
+                    code: 124,
+                    message: "timed out while building image".into(),
+                }
+                .into());
+            }
+            let signal_code = signal.load(Ordering::Relaxed);
+            if signal_code != 0 {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = out.join();
+                let _ = err.join();
+                return Err(ExitError {
+                    code: signal_code as i32,
+                    message: "cancelled while building image".into(),
+                }
+                .into());
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+        out.join()
+            .map_err(|_| anyhow::anyhow!("build stdout drain panicked"))??;
+        err.join()
+            .map_err(|_| anyhow::anyhow!("build stderr drain panicked"))??;
+        if !status.success() {
+            return Err(ExitError {
+                code: 3,
+                message: format!("Docker build failed with {status}"),
+            }
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn docker_image_exists_controlled(
+    tag: &str,
+    deadline: Option<Instant>,
+    signal: &AtomicUsize,
+) -> Result<bool> {
+    let mut child = Command::new("docker")
+        .args(["image", "inspect", tag])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .context("failed to inspect image")?;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(status.success());
+        }
+        let code = signal.load(Ordering::Relaxed);
+        if code != 0 || deadline.is_some_and(|d| Instant::now() >= d) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ExitError {
+                code: if code == 0 { 124 } else { code as i32 },
+                message: "Docker image inspection cancelled".into(),
+            }
+            .into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
 fn stop(output_dir: &Path, grace: u64) -> Result<()> {
     let path = output_dir.join("run.json");
     let mut r: RunRecord = serde_json::from_slice(
@@ -677,6 +1007,17 @@ fn stop(output_dir: &Path, grace: u64) -> Result<()> {
         let actual = docker_output(&["context", "show"])?;
         if actual != expected {
             bail!("Docker context changed from `{expected}` to `{actual}`; refusing cleanup");
+        }
+    }
+    if let Some(expected) = r.docker_endpoint.as_deref() {
+        let actual = docker_output(&[
+            "context",
+            "inspect",
+            "--format",
+            "{{(index .Endpoints \"docker\").Host}}",
+        ])?;
+        if actual != expected {
+            bail!("Docker endpoint changed; refusing cleanup");
         }
     }
     let label = docker_output(&[
@@ -698,8 +1039,12 @@ fn stop(output_dir: &Path, grace: u64) -> Result<()> {
 fn stop_container(id: &str, grace: u64) {
     let _ = Command::new("docker")
         .args(["stop", "--time", &grace.to_string(), id])
+        .stdout(Stdio::null())
         .status();
-    let _ = Command::new("docker").args(["rm", "-f", id]).status();
+    let _ = Command::new("docker")
+        .args(["rm", "-f", id])
+        .stdout(Stdio::null())
+        .status();
 }
 fn inspect_exit(id: &str) -> Option<i32> {
     docker_output(&["inspect", "--format", "{{.State.ExitCode}}", id])
@@ -708,6 +1053,9 @@ fn inspect_exit(id: &str) -> Option<i32> {
         .ok()
 }
 fn final_assistant_text(v: &Value) -> Option<String> {
+    if v.get("type")?.as_str()? != "message_end" {
+        return None;
+    }
     let message = v.get("message")?;
     if message.get("role")?.as_str()? != "assistant" {
         return None;
@@ -751,6 +1099,7 @@ fn atomic_write(path: &Path, data: &[u8]) -> Result<()> {
         f.sync_all()?;
     }
     fs::rename(tmp, path)?;
+    set_private_file_permissions(path)?;
     Ok(())
 }
 fn now_ms() -> u128 {
@@ -772,11 +1121,38 @@ fn docker_output(args: &[&str]) -> Result<String> {
     }
     Ok(String::from_utf8(o.stdout)?.trim().into())
 }
-fn docker_output_owned(args: &[String]) -> Result<String> {
-    let o = Command::new("docker")
+fn docker_create_controlled(
+    args: &[String],
+    deadline: Option<Instant>,
+    signal: &AtomicUsize,
+) -> Result<String> {
+    let mut child = Command::new("docker")
         .args(args)
-        .output()
-        .context("failed to run Docker")?;
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("failed to run Docker create")?;
+    loop {
+        if child.try_wait()?.is_some() {
+            break;
+        }
+        let signal_code = signal.load(Ordering::Relaxed);
+        if signal_code != 0 || deadline.is_some_and(|d| Instant::now() >= d) {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(ExitError {
+                code: if signal_code == 0 {
+                    124
+                } else {
+                    signal_code as i32
+                },
+                message: "Docker create cancelled".into(),
+            }
+            .into());
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+    let o = child.wait_with_output()?;
     if !o.status.success() {
         bail!(
             "Docker create failed: {}",
@@ -788,6 +1164,7 @@ fn docker_output_owned(args: &[String]) -> Result<String> {
 fn docker_status(args: &[&str]) -> bool {
     Command::new("docker")
         .args(args)
+        .stdout(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -797,14 +1174,44 @@ fn set_private_permissions(path: &Path) -> Result<()> {
     fs::set_permissions(path, fs::Permissions::from_mode(0o700))?;
     Ok(())
 }
+#[cfg(unix)]
+fn set_private_file_permissions(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
+}
 #[cfg(not(unix))]
 fn set_private_permissions(_: &Path) -> Result<()> {
     Ok(())
+}
+#[cfg(not(unix))]
+fn set_private_file_permissions(_: &Path) -> Result<()> {
+    Ok(())
+}
+
+fn canonicalize_prospective(path: &Path) -> Result<PathBuf> {
+    let mut missing = Vec::new();
+    let mut cursor = path;
+    while !cursor.exists() {
+        missing.push(
+            cursor
+                .file_name()
+                .context("path has no existing ancestor")?
+                .to_os_string(),
+        );
+        cursor = cursor.parent().context("path has no existing ancestor")?;
+    }
+    let mut resolved = fs::canonicalize(cursor)?;
+    for part in missing.iter().rev() {
+        resolved.push(part);
+    }
+    Ok(resolved)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::tempdir;
     #[test]
     fn rejects_managed_and_unknown_pi_args() {
         assert!(validate_pi_args(&["--mode=json".into()]).is_err());
@@ -824,5 +1231,37 @@ mod tests {
     fn extracts_authoritative_message_text() {
         let v = json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]}});
         assert_eq!(final_assistant_text(&v).as_deref(), Some("hello"));
+        let update =
+            json!({"type":"message_update","message":{"role":"assistant","content":"wrong"}});
+        assert_eq!(final_assistant_text(&update), None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn prospective_paths_resolve_symlinked_ancestors() {
+        use std::os::unix::fs::symlink;
+        let root = tempdir().unwrap();
+        let mounted = root.path().join("mounted");
+        fs::create_dir(&mounted).unwrap();
+        let link = root.path().join("link");
+        symlink(&mounted, &link).unwrap();
+        assert!(
+            canonicalize_prospective(&link.join("future"))
+                .unwrap()
+                .starts_with(fs::canonicalize(mounted).unwrap())
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_artifacts_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempdir().unwrap();
+        let path = root.path().join("result.json");
+        atomic_write(&path, b"{}\n").unwrap();
+        assert_eq!(
+            fs::metadata(path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
     }
 }
