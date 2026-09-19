@@ -1191,14 +1191,22 @@ fn build_images_controlled(
         let mut stderr = child.stderr.take().context("build stderr unavailable")?;
         let out_log = OpenOptions::new().append(true).open(diagnostics)?;
         let err_log = OpenOptions::new().append(true).open(diagnostics)?;
-        let out = thread::spawn(move || {
-            let mut log = out_log;
-            io::copy(&mut stdout, &mut log)
+        let (diag_tx, diag_rx) = mpsc::sync_channel::<Vec<u8>>(32);
+        thread::spawn(move || {
+            let mut target = io::stderr().lock();
+            while let Ok(bytes) = diag_rx.recv() {
+                if target
+                    .write_all(&bytes)
+                    .and_then(|_| target.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
         });
-        let err = thread::spawn(move || {
-            let mut log = err_log;
-            io::copy(&mut stderr, &mut log)
-        });
+        let out_tx = diag_tx.clone();
+        let out = thread::spawn(move || drain_diagnostic(&mut stdout, out_log, out_tx));
+        let err = thread::spawn(move || drain_diagnostic(&mut stderr, err_log, diag_tx));
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -1238,6 +1246,24 @@ fn build_images_controlled(
         }
     }
     Ok(())
+}
+
+fn drain_diagnostic(
+    source: &mut impl Read,
+    mut log: File,
+    tee: mpsc::SyncSender<Vec<u8>>,
+) -> io::Result<u64> {
+    let mut total = 0;
+    let mut buffer = [0u8; 8192];
+    loop {
+        let count = source.read(&mut buffer)?;
+        if count == 0 {
+            return Ok(total);
+        }
+        log.write_all(&buffer[..count])?;
+        total += count as u64;
+        let _ = tee.try_send(buffer[..count].to_vec());
+    }
 }
 
 fn docker_image_exists_controlled(
