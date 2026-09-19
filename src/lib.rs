@@ -29,6 +29,7 @@ const DEFAULT_PACKAGES: &[&str] = &[
     "curl",
     "wget",
     "git",
+    "gh",
     "openssh-client",
     "jq",
     "unzip",
@@ -1265,6 +1266,7 @@ mod tests {
         });
 
         assert!(dockerfile.contains("apt-get install -y --no-install-recommends bash"));
+        assert!(dockerfile.contains(" gh"));
         assert!(dockerfile.contains("python3-venv"));
         assert!(dockerfile.contains("ripgrep"));
         assert_eq!(dockerfile.matches(" git").count(), 1);

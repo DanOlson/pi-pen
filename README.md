@@ -188,6 +188,7 @@ packages = [
   "curl",
   "wget",
   "git",
+  "gh",
   "openssh-client",
   "jq",
   "unzip",
