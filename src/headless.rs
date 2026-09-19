@@ -105,6 +105,7 @@ struct FailureGuard {
     run_id: Uuid,
     started: u128,
     armed: bool,
+    classification: Arc<AtomicUsize>,
 }
 impl Drop for FailureGuard {
     fn drop(&mut self) {
@@ -118,12 +119,25 @@ impl Drop for FailureGuard {
             record.updated_at_unix_ms = now_ms();
             let _ = write_json_atomic(&self.output.join("run.json"), &record);
         }
+        let code = self.classification.load(Ordering::Relaxed) as i32;
+        let wrapper = if matches!(code, 124 | 130 | 143) {
+            code
+        } else {
+            3
+        };
+        let status = if wrapper == 124 {
+            "timed_out"
+        } else if matches!(wrapper, 130 | 143) {
+            "cancelled"
+        } else {
+            "failed"
+        };
         let result = ResultRecord {
             schema_version: SCHEMA_VERSION,
             run_id: self.run_id,
-            status: "failed".into(),
+            status: status.into(),
             reason: "launcher_error".into(),
-            wrapper_exit_code: 3,
+            wrapper_exit_code: wrapper,
             container_exit_code: None,
             started_at_unix_ms: self.started,
             finished_at_unix_ms: now_ms(),
@@ -258,6 +272,7 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         run_id,
         started,
         armed: true,
+        classification: Arc::clone(&signal),
     };
     fs::create_dir(output.join("sessions")).context("failed to create sessions directory")?;
     set_private_permissions(&output.join("sessions"))?;
@@ -280,6 +295,7 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         options.pull,
         deadline,
         &signal,
+        &output.join("stderr.log"),
     )?;
     record.image = Some(tag.clone());
     record.state = "starting".into();
@@ -306,7 +322,8 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         launch: &launch,
         env_file: env_file.path(),
     });
-    let container_id = docker_create_controlled(&create_args, deadline, &signal)
+    let cid_file = output.join("container.cid");
+    let container_id = docker_create_controlled(&create_args, &cid_file, deadline, &signal)
         .context("failed to create worker container")?;
     if container_id.is_empty() {
         bail!("docker create returned an empty container ID");
@@ -322,7 +339,7 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         &mut record,
         &signal,
     );
-    let cleanup = docker_status(&["rm", "-f", &container_id]);
+    let cleanup = docker_remove_idempotent(&container_id);
     let (mut status, mut reason, mut wrapper, raw, response) = match terminal {
         Ok(v) => v,
         Err(e) => (
@@ -363,6 +380,9 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
     };
     write_json_atomic(&output.join("result.json"), &result)?;
     failure_guard.armed = false;
+    if mode == Mode::Exec {
+        emit_terminal_record(&output, run_id, &status, wrapper)?;
+    }
     if !cleanup {
         eprintln!("warning: failed to remove owned container {container_id}");
     }
@@ -380,6 +400,56 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
 }
 
 type Terminal = (String, String, i32, Option<i32>, Option<String>);
+
+type WriteAck = mpsc::Sender<std::result::Result<(), String>>;
+struct ProtocolWriter {
+    tx: mpsc::SyncSender<(Vec<u8>, WriteAck)>,
+    failed: Arc<AtomicUsize>,
+}
+impl ProtocolWriter {
+    fn new() -> Self {
+        let (tx, rx) = mpsc::sync_channel::<(Vec<u8>, WriteAck)>(32);
+        let failed = Arc::new(AtomicUsize::new(0));
+        let thread_failed = Arc::clone(&failed);
+        thread::spawn(move || {
+            let mut stdout = io::stdout().lock();
+            while let Ok((bytes, ack)) = rx.recv() {
+                let result = stdout
+                    .write_all(&bytes)
+                    .and_then(|_| stdout.flush())
+                    .map_err(|e| e.to_string());
+                let failed = result.is_err();
+                if failed {
+                    thread_failed.store(1, Ordering::Relaxed);
+                }
+                let _ = ack.send(result);
+                if failed {
+                    break;
+                }
+            }
+        });
+        Self { tx, failed }
+    }
+    fn send(&self, bytes: Vec<u8>) -> Result<()> {
+        if self.failed.load(Ordering::Relaxed) != 0 {
+            bail!("protocol stdout is closed");
+        }
+        let (ack_tx, ack_rx) = mpsc::channel();
+        self.tx
+            .try_send((bytes, ack_tx))
+            .map_err(|error| anyhow::anyhow!("protocol stdout backpressure: {error}"))?;
+        match ack_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Ok(())) => Ok(()),
+            Ok(Err(error)) => bail!("protocol stdout write failed: {error}"),
+            Err(_) => bail!("protocol stdout consumer did not make progress"),
+        }
+    }
+    fn send_json(&self, value: &Value) -> Result<()> {
+        let mut bytes = serde_json::to_vec(value)?;
+        bytes.push(b'\n');
+        self.send(bytes)
+    }
+}
 
 fn supervise(
     output: &Path,
@@ -421,17 +491,17 @@ fn supervise(
                 break;
             }
             log.write_all(&buf[..n])?;
-            io::stderr().write_all(&buf[..n])?;
-            io::stderr().flush()?;
         }
         Ok(())
     });
     let (eof_tx, eof_rx) = mpsc::channel();
     if mode == Mode::Exec {
-        child_in
-            .write_all(prompt.as_deref().unwrap_or_default())
-            .context("failed to send prompt")?;
-        child_in.flush()?;
+        if let Err(error) = child_in.write_all(prompt.as_deref().unwrap_or_default())
+            && error.kind() != io::ErrorKind::BrokenPipe
+        {
+            return Err(error).context("failed to send prompt");
+        }
+        let _ = child_in.flush();
         drop(child_in);
     } else {
         thread::spawn(move || {
@@ -485,13 +555,19 @@ fn supervise(
         .append(true)
         .open(&events_path)?;
     set_private_file_permissions(&events_path)?;
+    let protocol_out = ProtocolWriter::new();
     if mode == Mode::Exec {
         seq += 1;
         let envelope = json!({"schema_version":SCHEMA_VERSION,"type":"run_started","run_id":record.run_id,"seq":seq});
         write_json_line(&mut events, &envelope)?;
-        write_json_line(&mut io::stdout(), &envelope)?;
+        protocol_out.send_json(&envelope)?;
     }
     loop {
+        if protocol_out.failed.load(Ordering::Relaxed) != 0 {
+            protocol_error = Some("protocol stdout is closed".into());
+            stop_container(id, 1);
+            break;
+        }
         let signal_code = signal.load(Ordering::Relaxed);
         if signal_code != 0 {
             record.state = "stopping".into();
@@ -531,15 +607,23 @@ fn supervise(
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
             Ok(Ok(Some(line))) => {
+                if !line.ends_with('\n') {
+                    protocol_error = Some("unterminated protocol record".into());
+                    stop_container(id, 1);
+                    break;
+                }
                 if mode == Mode::Rpc {
-                    events.write_all(line.as_bytes())?;
-                    io::stdout().write_all(line.as_bytes())?;
-                } else {
-                    if !line.ends_with('\n') {
-                        protocol_error = Some("unterminated pi JSON record".into());
+                    if !matches!(
+                        serde_json::from_str::<Value>(line.trim_end()),
+                        Ok(Value::Object(_))
+                    ) {
+                        protocol_error = Some("invalid pi RPC JSON record".into());
                         stop_container(id, 1);
                         break;
                     }
+                    events.write_all(line.as_bytes())?;
+                    protocol_out.send(line.into_bytes())?;
+                } else {
                     let event: Value = match serde_json::from_str(line.trim_end()) {
                         Ok(v @ Value::Object(_)) => v,
                         _ => {
@@ -554,11 +638,15 @@ fn supervise(
                     if event.get("type").and_then(Value::as_str) == Some("message_end")
                         && event
                             .get("message")
+                            .and_then(|m| m.get("role"))
+                            .and_then(Value::as_str)
+                            == Some("assistant")
+                    {
+                        unrecovered_error = event
+                            .get("message")
                             .and_then(|m| m.get("stopReason"))
                             .and_then(Value::as_str)
-                            .is_some_and(|r| matches!(r, "error" | "aborted"))
-                    {
-                        unrecovered_error = true;
+                            .is_some_and(|r| matches!(r, "error" | "aborted"));
                     }
                     if let Some(text) = final_assistant_text(&event) {
                         response = Some(text);
@@ -566,7 +654,7 @@ fn supervise(
                     seq += 1;
                     let envelope = json!({"schema_version":SCHEMA_VERSION,"type":"pi_event","run_id":record.run_id,"seq":seq,"event":event});
                     write_json_line(&mut events, &envelope)?;
-                    write_json_line(&mut io::stdout(), &envelope)?;
+                    protocol_out.send_json(&envelope)?;
                 }
             }
             Ok(Ok(None)) => break,
@@ -624,13 +712,19 @@ fn supervise(
     } else {
         outcome(status, mode, response)?
     };
-    if mode == Mode::Exec {
-        seq += 1;
-        let envelope = json!({"schema_version":SCHEMA_VERSION,"type":"run_finished","run_id":record.run_id,"seq":seq,"status":terminal.0,"exit_code":terminal.2});
-        write_json_line(&mut events, &envelope)?;
-        write_json_line(&mut io::stdout(), &envelope)?;
-    }
     Ok(terminal)
+}
+
+fn emit_terminal_record(output: &Path, run_id: Uuid, status: &str, exit_code: i32) -> Result<()> {
+    let path = output.join("events.jsonl");
+    let seq = File::open(&path)
+        .map(|file| BufReader::new(file).lines().count() as u64 + 1)
+        .unwrap_or(1);
+    let envelope = json!({"schema_version":SCHEMA_VERSION,"type":"run_finished","run_id":run_id,"seq":seq,"status":status,"exit_code":exit_code});
+    let mut events = OpenOptions::new().create(true).append(true).open(&path)?;
+    set_private_file_permissions(&path)?;
+    write_json_line(&mut events, &envelope)?;
+    ProtocolWriter::new().send_json(&envelope)
 }
 
 fn outcome(status: ExitStatus, mode: Mode, response: Option<String>) -> Result<Terminal> {
@@ -677,6 +771,8 @@ fn create_args(spec: &CreateSpec<'_>) -> Vec<String> {
         "create".into(),
         "--init".into(),
         "-i".into(),
+        "--cidfile".into(),
+        spec.output.join("container.cid").display().to_string(),
         "--label".into(),
         format!("io.pi-sandbox.run-id={}", spec.record.run_id),
         "--label".into(),
@@ -862,7 +958,13 @@ fn build_images_controlled(
     pull: bool,
     deadline: Option<Instant>,
     signal: &AtomicUsize,
+    diagnostics: &Path,
 ) -> Result<()> {
+    let _ = OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(diagnostics)?;
+    set_private_file_permissions(diagnostics)?;
     for (index, image) in images.iter().enumerate() {
         let lock_path = std::env::temp_dir().join(format!(
             "pi-sandbox-image-{}.lock",
@@ -887,6 +989,7 @@ fn build_images_controlled(
                         .into());
                     }
                     if deadline.is_some_and(|d| Instant::now() >= d) {
+                        signal.store(124, Ordering::Relaxed);
                         return Err(ExitError {
                             code: 124,
                             message: "timed out waiting for image lock".into(),
@@ -912,17 +1015,24 @@ fn build_images_controlled(
             .context("failed to start Docker build")?;
         let mut stdout = child.stdout.take().context("build stdout unavailable")?;
         let mut stderr = child.stderr.take().context("build stderr unavailable")?;
-        let out = thread::spawn(move || io::copy(&mut stdout, &mut io::stderr()));
-        let err = thread::spawn(move || io::copy(&mut stderr, &mut io::stderr()));
+        let out_log = OpenOptions::new().append(true).open(diagnostics)?;
+        let err_log = OpenOptions::new().append(true).open(diagnostics)?;
+        let out = thread::spawn(move || {
+            let mut log = out_log;
+            io::copy(&mut stdout, &mut log)
+        });
+        let err = thread::spawn(move || {
+            let mut log = err_log;
+            io::copy(&mut stderr, &mut log)
+        });
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
             }
             if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+                signal.store(124, Ordering::Relaxed);
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out.join();
-                let _ = err.join();
                 return Err(ExitError {
                     code: 124,
                     message: "timed out while building image".into(),
@@ -933,8 +1043,6 @@ fn build_images_controlled(
             if signal_code != 0 {
                 let _ = child.kill();
                 let _ = child.wait();
-                let _ = out.join();
-                let _ = err.join();
                 return Err(ExitError {
                     code: signal_code as i32,
                     message: "cancelled while building image".into(),
@@ -975,6 +1083,9 @@ fn docker_image_exists_controlled(
         }
         let code = signal.load(Ordering::Relaxed);
         if code != 0 || deadline.is_some_and(|d| Instant::now() >= d) {
+            if code == 0 {
+                signal.store(124, Ordering::Relaxed);
+            }
             let _ = child.kill();
             let _ = child.wait();
             return Err(ExitError {
@@ -1029,16 +1140,15 @@ fn stop(output_dir: &Path, grace: u64) -> Result<()> {
     r.state = "stopping".into();
     update_record(output_dir, &mut r)?;
     stop_container(&id, grace);
+    if !docker_remove_idempotent(&id) {
+        bail!("failed to remove owned container {id}");
+    }
     Ok(())
 }
 
 fn stop_container(id: &str, grace: u64) {
     let _ = Command::new("docker")
         .args(["stop", "--time", &grace.to_string(), id])
-        .stdout(Stdio::null())
-        .status();
-    let _ = Command::new("docker")
-        .args(["rm", "-f", id])
         .stdout(Stdio::null())
         .status();
 }
@@ -1119,6 +1229,7 @@ fn docker_output(args: &[&str]) -> Result<String> {
 }
 fn docker_create_controlled(
     args: &[String],
+    cid_file: &Path,
     deadline: Option<Instant>,
     signal: &AtomicUsize,
 ) -> Result<String> {
@@ -1134,8 +1245,18 @@ fn docker_create_controlled(
         }
         let signal_code = signal.load(Ordering::Relaxed);
         if signal_code != 0 || deadline.is_some_and(|d| Instant::now() >= d) {
+            if signal_code == 0 {
+                signal.store(124, Ordering::Relaxed);
+            }
             let _ = child.kill();
             let _ = child.wait();
+            if let Ok(id) = fs::read_to_string(cid_file) {
+                let id = id.trim();
+                if !id.is_empty() {
+                    stop_container(id, 1);
+                    let _ = docker_remove_idempotent(id);
+                }
+            }
             return Err(ExitError {
                 code: if signal_code == 0 {
                     124
@@ -1167,6 +1288,18 @@ fn docker_status(args: &[&str]) -> bool {
         .stdout(Stdio::null())
         .status()
         .is_ok_and(|s| s.success())
+}
+
+fn docker_remove_idempotent(id: &str) -> bool {
+    if docker_status(&["rm", "-f", id]) {
+        return true;
+    }
+    Command::new("docker")
+        .args(["inspect", id])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| !status.success())
 }
 #[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<()> {
