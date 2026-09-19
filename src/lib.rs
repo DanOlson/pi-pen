@@ -14,7 +14,10 @@ pub use launch::{
 
 const PROJECT_MANIFEST: &str = ".pi-env.toml";
 const DEFAULT_BASE_IMAGE: &str = "node:22-bookworm";
-const DEFAULT_PI_INSTALL: &str = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent";
+const DEFAULT_PI_INSTALL: &str =
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1";
+
+pub mod headless;
 const DEFAULT_PACKAGES: &[&str] = &[
     "bash",
     "ca-certificates",
@@ -75,6 +78,7 @@ pub enum Command {
         pi_args: Vec<String>,
         overrides: RunOverrides,
     },
+    Headless(headless::HeadlessCommand),
 }
 
 #[derive(Debug)]
@@ -239,6 +243,9 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 env_file: Some(env_file.path()),
             };
             run_process_interactive(launch::run_invocation(&context, &launch))?;
+        }
+        Command::Headless(command) => {
+            headless::run(command, &cli.cwd)?;
         }
     }
 
@@ -703,7 +710,7 @@ pub fn build_invocation(cache: &Path, tag: &str, pull: bool) -> Result<DockerInv
 
 fn ensure_image(cache: &Path, tag: &str, rebuild: bool, pull: bool) -> Result<()> {
     if !rebuild && !pull && docker_image_exists(tag)? {
-        println!("Reusing image {tag}");
+        eprintln!("Reusing image {tag}");
         return Ok(());
     }
 
