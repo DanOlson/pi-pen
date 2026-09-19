@@ -1262,8 +1262,8 @@ fn build_images_controlled(
             }
             thread::sleep(Duration::from_millis(50));
         };
-        recv_diagnostic_drain(out, deadline)?;
-        recv_diagnostic_drain(err, deadline)?;
+        recv_diagnostic_drain(out, deadline, signal)?;
+        recv_diagnostic_drain(err, deadline, signal)?;
         if !status.success() {
             return Err(ExitError {
                 code: 3,
@@ -1309,14 +1309,22 @@ fn spawn_diagnostic_drain(
 fn recv_diagnostic_drain(
     rx: mpsc::Receiver<io::Result<()>>,
     deadline: Option<Instant>,
+    signal: &AtomicUsize,
 ) -> Result<()> {
     let wait = deadline
         .and_then(|d| d.checked_duration_since(Instant::now()))
         .unwrap_or(Duration::from_secs(5))
         .min(Duration::from_secs(5));
-    rx.recv_timeout(wait)
-        .context("timed out draining Docker build output")?
-        .context("failed draining Docker build output")
+    match rx.recv_timeout(wait) {
+        Ok(result) => result.context("failed draining Docker build output"),
+        Err(error) => {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                signal.store(124, Ordering::Relaxed);
+            }
+            Err(classify_control_error(error.into(), signal))
+                .context("timed out draining Docker build output")
+        }
+    }
 }
 
 fn docker_image_exists_controlled(
@@ -1583,22 +1591,67 @@ fn docker_create_controlled(
         }
         thread::sleep(Duration::from_millis(25));
     };
-    let (stdout, stdout_overflow) = recv_capture(stdout_rx, deadline)?;
-    let (stderr, stderr_overflow) = recv_capture(stderr_rx, deadline)?;
+    let (stdout, stdout_overflow) = match recv_capture(stdout_rx, deadline, signal) {
+        Ok(value) => value,
+        Err(error) => return Err(create_failure(cid_file, signal, error)),
+    };
+    let (stderr, stderr_overflow) = match recv_capture(stderr_rx, deadline, signal) {
+        Ok(value) => value,
+        Err(error) => return Err(create_failure(cid_file, signal, error)),
+    };
     if stdout_overflow || stderr_overflow {
-        bail!("Docker create output exceeded 1 MiB");
+        return Err(create_failure(
+            cid_file,
+            signal,
+            anyhow::anyhow!("Docker create output exceeded 1 MiB"),
+        ));
     }
     if !status.success() {
-        return Err(ExitError {
-            code: 3,
-            message: format!(
+        return Err(create_failure(
+            cid_file,
+            signal,
+            anyhow::anyhow!(
                 "Docker create failed: {}",
                 String::from_utf8_lossy(&stderr).trim()
             ),
-        }
-        .into());
+        ));
     }
-    Ok(String::from_utf8(stdout)?.trim().into())
+    match String::from_utf8(stdout) {
+        Ok(value) => Ok(value.trim().into()),
+        Err(error) => Err(create_failure(cid_file, signal, error.into())),
+    }
+}
+
+fn create_failure(cid_file: &Path, signal: &AtomicUsize, error: anyhow::Error) -> anyhow::Error {
+    let mut container_id = None;
+    if let Ok(id) = fs::read_to_string(cid_file) {
+        let id = id.trim();
+        if !id.is_empty() {
+            container_id = Some(id.to_string());
+            if let Some(output) = cid_file.parent()
+                && let Ok(bytes) = fs::read(output.join("run.json"))
+                && let Ok(mut record) = serde_json::from_slice::<RunRecord>(&bytes)
+            {
+                record.container_id = Some(id.to_string());
+                let _ = write_json_atomic(&output.join("run.json"), &record);
+            }
+            stop_container(id, 1);
+            let _ = docker_remove_idempotent(id);
+        }
+    }
+    let code = signal.load(Ordering::Relaxed) as i32;
+    ExitError {
+        code: if matches!(code, 124 | 130 | 143) {
+            code
+        } else {
+            3
+        },
+        message: match container_id {
+            Some(id) => format!("{error:#}; cleaned up created container {id}"),
+            None => format!("{error:#}"),
+        },
+    }
+    .into()
 }
 
 fn docker_capture_controlled(
@@ -1635,8 +1688,10 @@ fn docker_capture_controlled(
         }
         thread::sleep(Duration::from_millis(25));
     };
-    let (stdout, stdout_overflow) = recv_capture(out, deadline)?;
-    let (stderr, stderr_overflow) = recv_capture(err, deadline)?;
+    let (stdout, stdout_overflow) = recv_capture(out, deadline, signal)
+        .map_err(|error| classify_control_error(error, signal))?;
+    let (stderr, stderr_overflow) = recv_capture(err, deadline, signal)
+        .map_err(|error| classify_control_error(error, signal))?;
     if stdout_overflow || stderr_overflow {
         bail!("Docker command output exceeded 1 MiB");
     }
@@ -1651,6 +1706,19 @@ fn docker_capture_controlled(
         .into());
     }
     Ok(String::from_utf8(stdout)?.trim().into())
+}
+
+fn classify_control_error(error: anyhow::Error, signal: &AtomicUsize) -> anyhow::Error {
+    let code = signal.load(Ordering::Relaxed) as i32;
+    if matches!(code, 124 | 130 | 143) {
+        ExitError {
+            code,
+            message: format!("{error:#}"),
+        }
+        .into()
+    } else {
+        error
+    }
 }
 
 fn capture_bounded(mut source: impl Read, limit: usize) -> io::Result<(Vec<u8>, bool)> {
@@ -1684,14 +1752,21 @@ fn spawn_bounded_capture(
 fn recv_capture(
     rx: mpsc::Receiver<io::Result<(Vec<u8>, bool)>>,
     deadline: Option<Instant>,
+    signal: &AtomicUsize,
 ) -> Result<(Vec<u8>, bool)> {
     let wait = deadline
         .and_then(|d| d.checked_duration_since(Instant::now()))
         .unwrap_or(Duration::from_secs(5))
         .min(Duration::from_secs(5));
-    rx.recv_timeout(wait)
-        .context("timed out draining Docker command output")?
-        .context("failed draining Docker command output")
+    match rx.recv_timeout(wait) {
+        Ok(result) => result.context("failed draining Docker command output"),
+        Err(error) => {
+            if deadline.is_some_and(|d| Instant::now() >= d) {
+                signal.store(124, Ordering::Relaxed);
+            }
+            Err(error).context("timed out draining Docker command output")
+        }
+    }
 }
 fn docker_status(args: &[&str]) -> bool {
     docker_status_bounded(args, Duration::from_secs(10))
@@ -1724,7 +1799,14 @@ fn docker_remove_idempotent(id: &str) -> bool {
     if docker_status(&["rm", "-f", id]) {
         return true;
     }
-    !docker_status_bounded(&["inspect", id], Duration::from_secs(10))
+    let signal = AtomicUsize::new(0);
+    let filter = format!("id={id}");
+    docker_capture_controlled(
+        &["ps", "-aq", "--filter", &filter],
+        Some(Instant::now() + Duration::from_secs(10)),
+        &signal,
+    )
+    .is_ok_and(|remaining| remaining.trim().is_empty())
 }
 #[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<()> {
