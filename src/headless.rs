@@ -265,6 +265,9 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
     if canonical_output.starts_with(&canonical_workspace) {
         bail!("output directory resolved inside the mounted workspace");
     }
+    if canonical_output.starts_with(fs::canonicalize(&home).unwrap_or_else(|_| home.clone())) {
+        bail!("claimed output directory resolved inside the mounted persistent home");
+    }
     if let Some(git) = &launch.git {
         for writable in [&git.common_dir, &git.git_dir] {
             let canonical = fs::canonicalize(writable).unwrap_or_else(|_| writable.clone());
@@ -1213,8 +1216,8 @@ fn build_images_controlled(
             .stderr(Stdio::piped())
             .spawn()
             .context("failed to start Docker build")?;
-        let mut stdout = child.stdout.take().context("build stdout unavailable")?;
-        let mut stderr = child.stderr.take().context("build stderr unavailable")?;
+        let stdout = child.stdout.take().context("build stdout unavailable")?;
+        let stderr = child.stderr.take().context("build stderr unavailable")?;
         let out_log = OpenOptions::new().append(true).open(diagnostics)?;
         let err_log = OpenOptions::new().append(true).open(diagnostics)?;
         let (diag_tx, diag_rx) = mpsc::sync_channel::<Vec<u8>>(32);
@@ -1231,8 +1234,8 @@ fn build_images_controlled(
             }
         });
         let out_tx = diag_tx.clone();
-        let out = thread::spawn(move || drain_diagnostic(&mut stdout, out_log, out_tx));
-        let err = thread::spawn(move || drain_diagnostic(&mut stderr, err_log, diag_tx));
+        let out = spawn_diagnostic_drain(stdout, out_log, out_tx);
+        let err = spawn_diagnostic_drain(stderr, err_log, diag_tx);
         let status = loop {
             if let Some(status) = child.try_wait()? {
                 break status;
@@ -1259,10 +1262,8 @@ fn build_images_controlled(
             }
             thread::sleep(Duration::from_millis(50));
         };
-        out.join()
-            .map_err(|_| anyhow::anyhow!("build stdout drain panicked"))??;
-        err.join()
-            .map_err(|_| anyhow::anyhow!("build stderr drain panicked"))??;
+        recv_diagnostic_drain(out, deadline)?;
+        recv_diagnostic_drain(err, deadline)?;
         if !status.success() {
             return Err(ExitError {
                 code: 3,
@@ -1290,6 +1291,32 @@ fn drain_diagnostic(
         total += count as u64;
         let _ = tee.try_send(buffer[..count].to_vec());
     }
+}
+
+fn spawn_diagnostic_drain(
+    mut source: impl Read + Send + 'static,
+    log: File,
+    tee: mpsc::SyncSender<Vec<u8>>,
+) -> mpsc::Receiver<io::Result<()>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let result = drain_diagnostic(&mut source, log, tee).map(|_| ());
+        let _ = tx.send(result);
+    });
+    rx
+}
+
+fn recv_diagnostic_drain(
+    rx: mpsc::Receiver<io::Result<()>>,
+    deadline: Option<Instant>,
+) -> Result<()> {
+    let wait = deadline
+        .and_then(|d| d.checked_duration_since(Instant::now()))
+        .unwrap_or(Duration::from_secs(5))
+        .min(Duration::from_secs(5));
+    rx.recv_timeout(wait)
+        .context("timed out draining Docker build output")?
+        .context("failed draining Docker build output")
 }
 
 fn docker_image_exists_controlled(
@@ -1514,9 +1541,21 @@ fn docker_create_controlled(
         .stderr(Stdio::piped())
         .spawn()
         .context("failed to run Docker create")?;
-    loop {
-        if child.try_wait()?.is_some() {
-            break;
+    let stdout_rx = spawn_bounded_capture(
+        child
+            .stdout
+            .take()
+            .context("Docker create stdout unavailable")?,
+    );
+    let stderr_rx = spawn_bounded_capture(
+        child
+            .stderr
+            .take()
+            .context("Docker create stderr unavailable")?,
+    );
+    let status = loop {
+        if let Some(status) = child.try_wait()? {
+            break status;
         }
         let signal_code = signal.load(Ordering::Relaxed);
         if signal_code != 0 || deadline.is_some_and(|d| Instant::now() >= d) {
@@ -1543,19 +1582,23 @@ fn docker_create_controlled(
             .into());
         }
         thread::sleep(Duration::from_millis(25));
+    };
+    let (stdout, stdout_overflow) = recv_capture(stdout_rx, deadline)?;
+    let (stderr, stderr_overflow) = recv_capture(stderr_rx, deadline)?;
+    if stdout_overflow || stderr_overflow {
+        bail!("Docker create output exceeded 1 MiB");
     }
-    let o = child.wait_with_output()?;
-    if !o.status.success() {
+    if !status.success() {
         return Err(ExitError {
             code: 3,
             message: format!(
                 "Docker create failed: {}",
-                String::from_utf8_lossy(&o.stderr).trim()
+                String::from_utf8_lossy(&stderr).trim()
             ),
         }
         .into());
     }
-    Ok(String::from_utf8(o.stdout)?.trim().into())
+    Ok(String::from_utf8(stdout)?.trim().into())
 }
 
 fn docker_capture_controlled(
@@ -1571,8 +1614,8 @@ fn docker_capture_controlled(
         .context("failed to run controlled Docker command")?;
     let stdout = child.stdout.take().context("Docker stdout unavailable")?;
     let stderr = child.stderr.take().context("Docker stderr unavailable")?;
-    let out = thread::spawn(move || capture_bounded(stdout, 1024 * 1024));
-    let err = thread::spawn(move || capture_bounded(stderr, 1024 * 1024));
+    let out = spawn_bounded_capture(stdout);
+    let err = spawn_bounded_capture(stderr);
     let status = loop {
         if let Some(status) = child.try_wait()? {
             break status;
@@ -1592,12 +1635,8 @@ fn docker_capture_controlled(
         }
         thread::sleep(Duration::from_millis(25));
     };
-    let (stdout, stdout_overflow) = out
-        .join()
-        .map_err(|_| anyhow::anyhow!("Docker stdout drain panicked"))??;
-    let (stderr, stderr_overflow) = err
-        .join()
-        .map_err(|_| anyhow::anyhow!("Docker stderr drain panicked"))??;
+    let (stdout, stdout_overflow) = recv_capture(out, deadline)?;
+    let (stderr, stderr_overflow) = recv_capture(err, deadline)?;
     if stdout_overflow || stderr_overflow {
         bail!("Docker command output exceeded 1 MiB");
     }
@@ -1631,6 +1670,29 @@ fn capture_bounded(mut source: impl Read, limit: usize) -> io::Result<(Vec<u8>, 
         }
     }
 }
+
+fn spawn_bounded_capture(
+    source: impl Read + Send + 'static,
+) -> mpsc::Receiver<io::Result<(Vec<u8>, bool)>> {
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let _ = tx.send(capture_bounded(source, 1024 * 1024));
+    });
+    rx
+}
+
+fn recv_capture(
+    rx: mpsc::Receiver<io::Result<(Vec<u8>, bool)>>,
+    deadline: Option<Instant>,
+) -> Result<(Vec<u8>, bool)> {
+    let wait = deadline
+        .and_then(|d| d.checked_duration_since(Instant::now()))
+        .unwrap_or(Duration::from_secs(5))
+        .min(Duration::from_secs(5));
+    rx.recv_timeout(wait)
+        .context("timed out draining Docker command output")?
+        .context("failed draining Docker command output")
+}
 fn docker_status(args: &[&str]) -> bool {
     docker_status_bounded(args, Duration::from_secs(10))
 }
@@ -1662,12 +1724,7 @@ fn docker_remove_idempotent(id: &str) -> bool {
     if docker_status(&["rm", "-f", id]) {
         return true;
     }
-    Command::new("docker")
-        .args(["inspect", id])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| !status.success())
+    !docker_status_bounded(&["inspect", id], Duration::from_secs(10))
 }
 #[cfg(unix)]
 fn set_private_permissions(path: &Path) -> Result<()> {
