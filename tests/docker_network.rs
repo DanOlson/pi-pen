@@ -4,12 +4,13 @@
 use pi_sandbox::launch::{EnvProvenance, ResolvedVariable};
 use pi_sandbox::{ContainerContext, HostAccess, LaunchEnvFile, ResolvedRunConfig};
 use std::collections::BTreeMap;
+use std::net::TcpListener;
 use std::path::Path;
 use std::process::Command;
 use tempfile::tempdir;
 
 struct Fixtures {
-    network: String,
+    networks: Vec<String>,
     containers: Vec<String>,
 }
 impl Drop for Fixtures {
@@ -17,9 +18,11 @@ impl Drop for Fixtures {
         for name in &self.containers {
             let _ = Command::new("docker").args(["rm", "-f", name]).output();
         }
-        let _ = Command::new("docker")
-            .args(["network", "rm", &self.network])
-            .output();
+        for network in &self.networks {
+            let _ = Command::new("docker")
+                .args(["network", "rm", network])
+                .output();
+        }
     }
 }
 
@@ -52,7 +55,7 @@ fn variable(value: &str) -> ResolvedVariable {
 
 fn session_args(
     name: &str,
-    network: &str,
+    networks: &[String],
     home: &Path,
     mut env: BTreeMap<String, ResolvedVariable>,
     command: &str,
@@ -65,7 +68,7 @@ fn session_args(
         },
     );
     let config = ResolvedRunConfig {
-        networks: vec![network.into()],
+        networks: networks.to_vec(),
         host_access: HostAccess::Desktop,
         namespace: name.into(),
         worktree_id: format!("wt_{name}"),
@@ -104,13 +107,14 @@ fn session_args(
 #[ignore = "requires a local Docker daemon and disposable Postgres/Redis images"]
 fn concurrent_sessions_share_services_but_isolate_selected_resources() {
     let suffix = format!("{}", std::process::id());
-    let network = format!("pi-sandbox-it-{suffix}");
+    let pg_network = format!("pi-sandbox-pg-net-{suffix}");
+    let redis_network = format!("pi-sandbox-redis-net-{suffix}");
     let postgres = format!("pi-sandbox-pg-{suffix}");
     let redis = format!("pi-sandbox-redis-{suffix}");
     let a = format!("pi-sandbox-a-{suffix}");
     let b = format!("pi-sandbox-b-{suffix}");
     let fixtures = Fixtures {
-        network: network.clone(),
+        networks: vec![pg_network.clone(), redis_network.clone()],
         containers: vec![a.clone(), b.clone(), postgres.clone(), redis.clone()],
     };
     docker(&[
@@ -118,7 +122,14 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
         "create".into(),
         "--label".into(),
         "pi-sandbox.test=networked-resources".into(),
-        network.clone(),
+        pg_network.clone(),
+    ]);
+    docker(&[
+        "network".into(),
+        "create".into(),
+        "--label".into(),
+        "pi-sandbox.test=networked-resources".into(),
+        redis_network.clone(),
     ]);
     docker(&[
         "run".into(),
@@ -126,7 +137,7 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
         "--name".into(),
         postgres.clone(),
         "--network".into(),
-        network.clone(),
+        pg_network.clone(),
         "--env".into(),
         "POSTGRES_PASSWORD=test-only".into(),
         "--env".into(),
@@ -139,7 +150,7 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
         "--name".into(),
         redis.clone(),
         "--network".into(),
-        network.clone(),
+        redis_network.clone(),
         "redis:7-alpine".into(),
     ]);
     for _ in 0..60 {
@@ -187,8 +198,9 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
             ("APP_REDIS_PREFIX".into(), variable(prefix)),
         ])
     };
-    let (_file_a, args_a) = session_args(&a, &network, dir.path(), common("app_a", "a:"), command);
-    let (_file_b, args_b) = session_args(&b, &network, dir.path(), common("app_b", "b:"), command);
+    let networks = vec![pg_network, redis_network];
+    let (_file_a, args_a) = session_args(&a, &networks, dir.path(), common("app_a", "a:"), command);
+    let (_file_b, args_b) = session_args(&b, &networks, dir.path(), common("app_b", "b:"), command);
     docker(&args_a);
     docker(&args_b);
     for _ in 0..60 {
@@ -286,4 +298,43 @@ fn concurrent_sessions_share_services_but_isolate_selected_resources() {
         "2"
     );
     drop(fixtures);
+}
+
+#[test]
+#[ignore = "requires Docker Desktop host.docker.internal"]
+fn docker_desktop_reaches_a_real_host_listener() {
+    let listener = TcpListener::bind("0.0.0.0:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = std::thread::spawn(move || {
+        let (mut stream, _) = listener.accept().unwrap();
+        use std::io::{Read, Write};
+        let mut request = [0_u8; 256];
+        let _ = stream.read(&mut request);
+        stream
+            .write_all(b"HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nhost-ok")
+            .unwrap();
+    });
+    let dir = tempdir().unwrap();
+    let config = ResolvedRunConfig {
+        networks: Vec::new(),
+        host_access: HostAccess::Desktop,
+        namespace: "host_test".into(),
+        worktree_id: "wt_host_test".into(),
+        env: BTreeMap::new(),
+        git: None,
+    };
+    let mut args = vec!["run".into(), "--rm".into()];
+    config.append_docker_create_args(
+        &mut args,
+        &ContainerContext {
+            cwd: dir.path(),
+            home: dir.path(),
+            uid: "0",
+            gid: "0",
+            env_file: None,
+        },
+    );
+    args.extend(["postgis/postgis:17-3.5".into(), "bash".into(), "-c".into(), format!("exec 3<>/dev/tcp/host.docker.internal/{port}; printf 'GET / HTTP/1.0\\r\\n\\r\\n' >&3; cat <&3")]);
+    assert!(docker(&args).contains("host-ok"));
+    server.join().unwrap();
 }
