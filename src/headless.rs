@@ -392,6 +392,7 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
     }
     if cid_file.exists() {
         set_private_file_permissions(&cid_file)?;
+        fs::remove_file(&cid_file).context("failed to remove temporary container ID file")?;
     }
     drop(env_file);
     record.container_id = Some(container_id.clone());
@@ -448,19 +449,19 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
     };
     write_json_atomic(&output.join("result.json"), &result)?;
     failure_guard.armed = false;
-    if mode == Mode::Exec {
-        if let Err(error) = emit_terminal_record(&output, run_id, &status, wrapper) {
-            result.status = "failed".into();
-            result.reason = "protocol_stdout_failed".into();
-            result.wrapper_exit_code = 3;
-            write_json_atomic(&output.join("result.json"), &result)?;
-            append_terminal_artifact(&output, run_id, "failed", 3)?;
-            return Err(ExitError {
-                code: 3,
-                message: format!("protocol stdout failed: {error:#}"),
-            }
-            .into());
+    if mode == Mode::Exec
+        && let Err(error) = emit_terminal_record(&output, run_id, &status, wrapper)
+    {
+        result.status = "failed".into();
+        result.reason = "protocol_stdout_failed".into();
+        result.wrapper_exit_code = 3;
+        write_json_atomic(&output.join("result.json"), &result)?;
+        append_terminal_artifact(&output, run_id, "failed", 3)?;
+        return Err(ExitError {
+            code: 3,
+            message: format!("protocol stdout failed: {error:#}"),
         }
+        .into());
     }
     if !cleanup {
         eprintln!("warning: failed to remove owned container {container_id}");
@@ -645,7 +646,7 @@ fn supervise(
                     }
                 },
                 Err(e) => {
-                    let _ = tx.send(Err(e.into()));
+                    let _ = tx.send(Err(e));
                     break;
                 }
             }
@@ -1652,6 +1653,18 @@ mod tests {
         assert_eq!(
             fs::metadata(path).unwrap().permissions().mode() & 0o777,
             0o600
+        );
+    }
+
+    #[test]
+    fn bounded_reader_rejects_record_over_limit_without_waiting_for_newline() {
+        let bytes = vec![b'x'; MAX_RECORD + 1];
+        let mut reader = BufReader::with_capacity(8192, io::Cursor::new(bytes));
+        assert!(
+            read_bounded_record(&mut reader)
+                .unwrap_err()
+                .to_string()
+                .contains("32 MiB")
         );
     }
 }
