@@ -39,7 +39,7 @@ cargo install --path . --force
 
 ```sh
 pi-sandbox init
-pi-sandbox run [ENV] [--rebuild] [--pull] [-- <pi args...>]
+pi-sandbox run [ENV] [--rebuild] [--pull] [network options] [-- <pi args...>]
 pi-sandbox exec [ENV] (--prompt-file PATH | --prompt-stdin) --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
 pi-sandbox rpc [ENV] --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
 pi-sandbox stop --output-dir PATH [--grace SECONDS]
@@ -261,10 +261,10 @@ an OS-backed exclusive lock for its canonical worktree; use distinct worktrees
 for parallel editing. `SIGKILL` and host crashes cannot guarantee cleanup, so
 retain the output directory and use `stop` to reconcile an orphan.
 
-Use `[env]` for variables needed while building the image. Use `[runtime_env]`
-for variables only needed when the container runs, such as final `PATH` values;
-runtime env is rendered after install commands so edits are less likely to
-invalidate expensive Docker layers.
+Both `[env]` and the historically named `[runtime_env]` are image defaults:
+they are rendered into Dockerfile `ENV` instructions and affect the image tag.
+Do not put connection secrets in either section. Use `[run]` for launch-only
+settings and explicitly selected ignored env files for credentials.
 
 Use `[git]` to seed Git identity into the container's persistent home without
 mounting host Git, SSH, or GitHub CLI config. On `run`, these values are written
@@ -284,6 +284,78 @@ This lets the pi agent and other tools keep credentials/config between runs
 even though each container is recreated.
 
 The project itself is still mounted separately at `/workspace`.
+
+## Networked services and launch environment
+
+`pi-sandbox` can join existing user-defined Docker networks and pass
+launch-only application settings without rebuilding the environment image:
+
+```toml
+[run]
+networks = ["myapp_default"]
+host_access = "desktop"
+env_files = [".pi-session.env"]
+namespace = "worktree"
+
+[run.env]
+PGHOST = "postgres"
+PGDATABASE = "app_{{namespace}}"
+REDIS_URL = "redis://redis:6379/0"
+APP_REDIS_PREFIX = "app:{{namespace}}:"
+```
+
+The services and named networks must already exist. `pi-sandbox` validates
+networks but never creates, migrates, flushes, or deletes external resources.
+Repeat `--network NAME` to replace the configured network list, or use
+`--default-network` to clear it. Other launch controls are
+`--host-access default|desktop|gateway`, repeated `--env-file PATH`, repeated
+`--env KEY=VALUE`, `--namespace NAME`, and `--dry-run`. A dry run performs
+local resolution and validation only; it redacts every environment value and
+does not contact Docker or create the persistent home.
+
+Manifest launch settings inherit parent-first. Omitted lists inherit, while an
+explicit empty list clears. `[run.env]` maps merge with child values winning.
+Environment precedence is image defaults, manifest env files, merged
+`[run.env]`, CLI env files, then CLI `--env`. Manifest env-file paths are
+relative to the manifest declaring the selected list; CLI paths are relative
+to the invoking directory.
+
+Env files use a deliberately small literal grammar: UTF-8 `KEY=VALUE` lines,
+blank lines, and comments whose first non-whitespace character is `#`. Values
+retain spaces, quotes, `#`, dollar signs, and additional equals signs. This is
+not a shell or dotenv parser: `export`, bare keys, and multiline values are
+rejected. Values are moved to Docker through a short-lived mode-0600 file and
+are not placed in the Docker command arguments. Docker administrators can
+still inspect a running container's environment; this is not a secret store.
+
+Only `[run.env]` expands `{{namespace}}` and `{{worktree_id}}`. The default
+namespace is a stable identifier derived from the canonical Git worktree root.
+An explicit namespace must match `[a-z][a-z0-9_]{0,39}`. Namespaces are naming
+aids, not isolation: applications must select separate pre-created databases
+or implement prefixes themselves. A Redis prefix does not isolate admin
+commands, pub/sub, or frameworks that ignore it.
+
+On Docker Desktop, workstation services are reached at
+`host.docker.internal:<port>` with `host_access = "desktop"`. For native Linux,
+`gateway` adds `host.docker.internal:host-gateway`; the service must listen on
+an address reachable from the bridge and its firewall/authentication should be
+configured accordingly. The gateway is the Docker host, not necessarily its
+loopback interface. Docker Desktop on Linux should normally use `desktop`.
+Remote daemons, Windows, rootless networking, and alternative VM runtimes are
+not verified in this version. The implementation is tested with Docker Engine
+27.3.1; multiple networks are attached using repeated `--network` options.
+
+Inside a session, `localhost` means the session container. No URL rewriting or
+port publishing is performed. When diagnosing connectivity, distinguish DNS
+failure, connection refusal/timeout, and application authentication errors;
+network existence validation does not prove a database is reachable.
+
+When run inside a linked Git worktree, pi-sandbox mounts only that worktree and
+the repository's Git administrative directories, then supplies `GIT_DIR`,
+`GIT_COMMON_DIR`, and `GIT_WORK_TREE`. Git status, staging, and commits work,
+but shared repository metadata remains writable shared state. Creating/removing
+worktrees inside the container, submodules, and unusual external object stores
+are not supported by this first version.
 
 ## File Ownership
 

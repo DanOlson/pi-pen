@@ -5,11 +5,16 @@ use std::fs;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
+use std::sync::{
+    Arc,
+    atomic::{AtomicBool, Ordering},
+};
+use std::time::{Duration, Instant};
 
 pub mod launch;
 pub use launch::{
-    ContainerContext, HostAccess, LaunchArgs, LaunchEnvFile, ResolvedRunConfig, RunConfig,
-    RunContext, RunOverrides,
+    ContainerContext, ContainerIdFile, HostAccess, LaunchArgs, LaunchEnvFile, ResolvedRunConfig,
+    RunConfig, RunContext, RunOverrides,
 };
 
 const PROJECT_MANIFEST: &str = ".pi-env.toml";
@@ -186,6 +191,7 @@ struct PreparedEnvironment {
 }
 
 pub fn run_cli(cli: Cli) -> Result<()> {
+    let signals = SignalState::install()?;
     match cli.command {
         Command::Build { env, rebuild, pull } => {
             let resolved = resolve_env(env.as_deref(), &cli.cwd)?;
@@ -232,6 +238,7 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             let home = persistent_home_dir(&cli.cwd, &resolved)?;
             seed_git_config(&home, prepared.git.as_ref())?;
             let env_file = LaunchEnvFile::new(&launch)?;
+            let cid_file = ContainerIdFile::new()?;
             let context = RunContext {
                 cwd: &cli.cwd,
                 home: &home,
@@ -241,8 +248,13 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 pi_args: &pi_args,
                 interactive: true,
                 env_file: Some(env_file.path()),
+                cid_file: Some(cid_file.path()),
             };
-            run_process_interactive(launch::run_invocation(&context, &launch))?;
+            run_process_interactive(
+                launch::run_invocation(&context, &launch),
+                &signals,
+                &cid_file,
+            )?;
         }
         Command::Headless(command) => {
             headless::run(command, &cli.cwd)?;
@@ -1079,14 +1091,81 @@ fn run_process(invocation: DockerInvocation) -> Result<()> {
     Ok(())
 }
 
-fn run_process_interactive(invocation: DockerInvocation) -> Result<()> {
-    let status = ProcessCommand::new(&invocation.program)
+struct SignalState {
+    interrupt: Arc<AtomicBool>,
+    terminate: Arc<AtomicBool>,
+    hangup: Arc<AtomicBool>,
+}
+
+impl SignalState {
+    fn install() -> Result<Self> {
+        let state = Self {
+            interrupt: Arc::new(AtomicBool::new(false)),
+            terminate: Arc::new(AtomicBool::new(false)),
+            hangup: Arc::new(AtomicBool::new(false)),
+        };
+        #[cfg(unix)]
+        {
+            signal_hook::flag::register(signal_hook::consts::SIGINT, Arc::clone(&state.interrupt))?;
+            signal_hook::flag::register(
+                signal_hook::consts::SIGTERM,
+                Arc::clone(&state.terminate),
+            )?;
+            signal_hook::flag::register(signal_hook::consts::SIGHUP, Arc::clone(&state.hangup))?;
+        }
+        Ok(state)
+    }
+
+    fn take(&self) -> Option<i32> {
+        if self.interrupt.swap(false, Ordering::Relaxed) {
+            Some(libc::SIGINT)
+        } else if self.terminate.swap(false, Ordering::Relaxed) {
+            Some(libc::SIGTERM)
+        } else if self.hangup.swap(false, Ordering::Relaxed) {
+            Some(libc::SIGHUP)
+        } else {
+            None
+        }
+    }
+}
+
+fn run_process_interactive(
+    invocation: DockerInvocation,
+    signals: &SignalState,
+    cid_file: &ContainerIdFile,
+) -> Result<()> {
+    let mut child = ProcessCommand::new(&invocation.program)
         .args(&invocation.args)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
-        .status()
+        .spawn()
         .with_context(|| format!("failed to run {}", invocation.program))?;
+    let mut forwarded_at = None;
+    let status = loop {
+        if let Some(status) = child.try_wait().context("failed waiting for Docker")? {
+            break status;
+        }
+        if let Some(signal) = signals.take() {
+            #[cfg(unix)]
+            unsafe {
+                libc::kill(child.id() as i32, signal);
+            }
+            forwarded_at = Some(Instant::now());
+        }
+        if forwarded_at.is_some_and(|at| at.elapsed() >= Duration::from_secs(5)) {
+            if let Some(id) = cid_file.id() {
+                let _ = ProcessCommand::new("docker")
+                    .args(["rm", "-f", &id])
+                    .status();
+            }
+            let _ = child.kill();
+            break child
+                .wait()
+                .context("failed waiting for terminated Docker")?;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    };
     if !status.success() {
         bail!("{} failed with status {status}", invocation.program);
     }
