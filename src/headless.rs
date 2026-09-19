@@ -270,6 +270,7 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         set_private_file_permissions(&cloned)?;
     }
     let cache = cache_dir()?;
+    crate::launch::preflight_networks(&launch)?;
     // Build output is diagnostics. Existing build helpers currently inherit stderr/stdout;
     // the reuse notice is deliberately stderr in machine mode.
     build_images_controlled(
@@ -280,7 +281,6 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         deadline,
         &signal,
     )?;
-    crate::launch::preflight_networks(&launch)?;
     record.image = Some(tag.clone());
     record.state = "starting".into();
     update_record(&output, &mut record)?;
@@ -1154,10 +1154,14 @@ fn docker_create_controlled(
     }
     let o = child.wait_with_output()?;
     if !o.status.success() {
-        bail!(
-            "Docker create failed: {}",
-            String::from_utf8_lossy(&o.stderr).trim()
-        );
+        return Err(ExitError {
+            code: 3,
+            message: format!(
+                "Docker create failed: {}",
+                String::from_utf8_lossy(&o.stderr).trim()
+            ),
+        }
+        .into());
     }
     Ok(String::from_utf8(o.stdout)?.trim().into())
 }
