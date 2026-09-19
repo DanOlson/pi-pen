@@ -1,9 +1,18 @@
-use anyhow::Result;
 use clap::{Args, Parser, Subcommand};
 use std::path::PathBuf;
+use std::process::ExitCode;
 
-fn main() -> Result<()> {
-    pi_sandbox::run_cli(Cli::parse().into())
+fn main() -> ExitCode {
+    match pi_sandbox::run_cli(Cli::parse().into()) {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(error) => {
+            eprintln!("Error: {error:#}");
+            let code = error
+                .downcast_ref::<pi_sandbox::headless::ExitError>()
+                .map_or(2, |e| e.code);
+            ExitCode::from(u8::try_from(code).unwrap_or(1))
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -27,6 +36,12 @@ enum Command {
     Init(InitArgs),
     /// Start an interactive pi session in an environment.
     Run(RunArgs),
+    /// Run one noninteractive assignment and stream versioned JSONL events.
+    Exec(ExecArgs),
+    /// Open a noninteractive pi RPC connection.
+    Rpc(RpcArgs),
+    /// Stop the exact managed container recorded in an output directory.
+    Stop(StopArgs),
 }
 
 #[derive(Debug, Args)]
@@ -68,6 +83,63 @@ struct RunArgs {
     /// Arguments passed through to pi.
     #[arg(last = true)]
     pi_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct ExecArgs {
+    /// Environment name or manifest path.
+    env: Option<String>,
+    #[arg(long)]
+    rebuild: bool,
+    #[arg(long)]
+    pull: bool,
+    /// Read the assignment from this local file.
+    #[arg(
+        long,
+        conflicts_with = "prompt_stdin",
+        required_unless_present = "prompt_stdin"
+    )]
+    prompt_file: Option<PathBuf>,
+    /// Read the assignment exactly once from stdin.
+    #[arg(
+        long,
+        conflicts_with = "prompt_file",
+        required_unless_present = "prompt_file"
+    )]
+    prompt_stdin: bool,
+    #[arg(long)]
+    output_dir: PathBuf,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: Option<u64>,
+    #[arg(long)]
+    resume_session: Option<PathBuf>,
+    #[arg(last = true)]
+    pi_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct RpcArgs {
+    env: Option<String>,
+    #[arg(long)]
+    rebuild: bool,
+    #[arg(long)]
+    pull: bool,
+    #[arg(long)]
+    output_dir: PathBuf,
+    #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
+    timeout: Option<u64>,
+    #[arg(long)]
+    resume_session: Option<PathBuf>,
+    #[arg(last = true)]
+    pi_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct StopArgs {
+    #[arg(long)]
+    output_dir: PathBuf,
+    #[arg(long, default_value_t = 10, value_parser = clap::value_parser!(u64).range(1..))]
+    grace: u64,
 }
 
 #[derive(Debug, Args)]
@@ -141,6 +213,40 @@ impl From<Cli> for pi_sandbox::Cli {
                     pull: args.pull,
                     pi_args: args.pi_args,
                 },
+                Command::Exec(args) => pi_sandbox::Command::Headless(
+                    pi_sandbox::headless::HeadlessCommand::Exec(pi_sandbox::headless::Options {
+                        env: args.env,
+                        rebuild: args.rebuild,
+                        pull: args.pull,
+                        output_dir: args.output_dir,
+                        timeout: args.timeout,
+                        resume_session: args.resume_session,
+                        prompt: Some(if let Some(path) = args.prompt_file {
+                            pi_sandbox::headless::Prompt::File(path)
+                        } else {
+                            pi_sandbox::headless::Prompt::Stdin
+                        }),
+                        pi_args: args.pi_args,
+                    }),
+                ),
+                Command::Rpc(args) => pi_sandbox::Command::Headless(
+                    pi_sandbox::headless::HeadlessCommand::Rpc(pi_sandbox::headless::Options {
+                        env: args.env,
+                        rebuild: args.rebuild,
+                        pull: args.pull,
+                        output_dir: args.output_dir,
+                        timeout: args.timeout,
+                        resume_session: args.resume_session,
+                        prompt: None,
+                        pi_args: args.pi_args,
+                    }),
+                ),
+                Command::Stop(args) => {
+                    pi_sandbox::Command::Headless(pi_sandbox::headless::HeadlessCommand::Stop {
+                        output_dir: args.output_dir,
+                        grace: args.grace,
+                    })
+                }
             },
             cwd: std::env::current_dir().unwrap_or_else(|_| PathBuf::from(".")),
         }

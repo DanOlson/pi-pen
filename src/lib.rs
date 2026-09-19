@@ -8,7 +8,10 @@ use std::process::{Command as ProcessCommand, Stdio};
 
 const PROJECT_MANIFEST: &str = ".pi-env.toml";
 const DEFAULT_BASE_IMAGE: &str = "node:22-bookworm";
-const DEFAULT_PI_INSTALL: &str = "npm install -g --ignore-scripts @earendil-works/pi-coding-agent";
+const DEFAULT_PI_INSTALL: &str =
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1";
+
+pub mod headless;
 const DEFAULT_PACKAGES: &[&str] = &[
     "bash",
     "ca-certificates",
@@ -68,6 +71,7 @@ pub enum Command {
         pull: bool,
         pi_args: Vec<String>,
     },
+    Headless(headless::HeadlessCommand),
 }
 
 #[derive(Debug)]
@@ -212,6 +216,9 @@ pub fn run_cli(cli: Cli) -> Result<()> {
             let home = persistent_home_dir(&cli.cwd, &resolved)?;
             seed_git_config(&home, prepared.git.as_ref())?;
             run_process_interactive(run_invocation(&cli.cwd, &home, tag, &uid, &gid, &pi_args))?;
+        }
+        Command::Headless(command) => {
+            headless::run(command, &cli.cwd)?;
         }
     }
 
@@ -676,7 +683,7 @@ pub fn build_invocation(cache: &Path, tag: &str, pull: bool) -> Result<DockerInv
 
 fn ensure_image(cache: &Path, tag: &str, rebuild: bool, pull: bool) -> Result<()> {
     if !rebuild && !pull && docker_image_exists(tag)? {
-        println!("Reusing image {tag}");
+        eprintln!("Reusing image {tag}");
         return Ok(());
     }
 
