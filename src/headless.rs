@@ -119,9 +119,10 @@ impl Drop for FailureGuard {
         if !self.armed {
             return;
         }
-        if let Ok(bytes) = fs::read(self.output.join("run.json"))
-            && let Ok(mut record) = serde_json::from_slice::<RunRecord>(&bytes)
-        {
+        let mut latest = fs::read(self.output.join("run.json"))
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<RunRecord>(&bytes).ok());
+        if let Some(record) = latest.as_mut() {
             record.state = "terminal".into();
             record.updated_at_unix_ms = now_ms();
             let _ = write_json_atomic(&self.output.join("run.json"), &record);
@@ -150,12 +151,14 @@ impl Drop for FailureGuard {
             finished_at_unix_ms: now_ms(),
             response_available: false,
             usage: None,
-            image: None,
-            pi_version: PI_VERSION.into(),
-            pi_compatibility: None,
-            container_id: None,
+            image: latest.as_ref().and_then(|r| r.image.clone()),
+            pi_version: latest
+                .as_ref()
+                .map_or_else(|| "unknown".into(), |r| r.pi_version.clone()),
+            pi_compatibility: latest.as_ref().and_then(|r| r.pi_compatibility.clone()),
+            container_id: latest.as_ref().and_then(|r| r.container_id.clone()),
             cleanup_succeeded: None,
-            session_files: Vec::new(),
+            session_files: session_files(&self.output.join("sessions")),
         };
         let _ = write_json_atomic(&self.output.join("result.json"), &result);
     }
