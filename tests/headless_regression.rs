@@ -615,3 +615,27 @@ fn namespace_adopt_copies_credentials_into_the_resolved_home() {
         .arg(&legacy);
     assert!(bounded_output(forced).status.success());
 }
+
+#[test]
+fn namespace_list_reports_metadata_credentials_and_age() {
+    let fixture = Fixture::new();
+    let output = bounded_output(fixture.command("success"));
+    assert!(output.status.success());
+
+    let mut list = fixture.base_command("success");
+    list.args(["namespace", "list"]);
+    let text = String::from_utf8(bounded_output(list).stdout).unwrap();
+    let row = text.lines().nth(1).expect("one home listed");
+    let columns: Vec<&str> = row.split('\t').collect();
+    assert_eq!(columns.len(), 6, "{row}");
+    assert_eq!(columns[1], "worktree default");
+    assert_eq!(columns[3], "default");
+    assert_eq!(columns[4], "no credentials");
+    assert_eq!(columns[5], "just now");
+
+    let mut json = fixture.base_command("success");
+    json.args(["namespace", "list", "--json"]);
+    let listings: Value = serde_json::from_slice(&bounded_output(json).stdout).unwrap();
+    assert!(listings[0]["last_used_unix_ms"].as_u64().unwrap() > 0);
+    assert_eq!(listings[0]["metadata"]["shared"], false);
+}

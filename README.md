@@ -388,7 +388,8 @@ rename or namespace change left a login behind in a `legacy` home.
 A home is keyed on the repository's Git common directory, the manifest `name`,
 and the namespace; it survives moving or renaming the manifest file. Each home
 carries a `pi-sandbox-home.json` describing those inputs, and `namespace list`
-labels homes created by older releases as `legacy`. Older default homes that
+labels homes created by older releases as `legacy` and shows when each was
+last used so stale homes are easy to spot. Older default homes that
 were keyed on the manifest path are renamed into place automatically the first
 time the new location is needed, so saved credentials carry forward. Headless
 launches print the resolved home and whether it holds pi credentials to stderr,

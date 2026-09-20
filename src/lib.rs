@@ -511,7 +511,39 @@ fn namespace_adopt(
 struct HomeListing {
     path: PathBuf,
     pi_credentials: bool,
+    /// Newest modification time among the home's pi agent files, or the directory.
+    last_used_unix_ms: Option<u128>,
     metadata: Option<HomeMetadata>,
+}
+
+fn home_last_used(home: &Path) -> Option<u128> {
+    let mut candidates = vec![home.to_path_buf()];
+    if let Ok(entries) = fs::read_dir(home.join(".pi/agent")) {
+        candidates.extend(entries.flatten().map(|entry| entry.path()));
+    }
+    candidates
+        .iter()
+        .filter_map(|path| fs::metadata(path).and_then(|m| m.modified()).ok())
+        .max()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_millis())
+}
+
+fn describe_age(last_used_unix_ms: Option<u128>) -> String {
+    let Some(then) = last_used_unix_ms else {
+        return "unknown".to_string();
+    };
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(then);
+    let seconds = now.saturating_sub(then) / 1000;
+    match seconds {
+        s if s < 60 => "just now".to_string(),
+        s if s < 3600 => format!("{}m ago", s / 60),
+        s if s < 86_400 => format!("{}h ago", s / 3600),
+        s => format!("{}d ago", s / 86_400),
+    }
 }
 
 fn namespace_list(json: bool) -> Result<()> {
@@ -530,6 +562,7 @@ fn namespace_list(json: bool) -> Result<()> {
                 .and_then(|bytes| serde_json::from_slice::<HomeMetadata>(&bytes).ok());
             listings.push(HomeListing {
                 pi_credentials: home_has_pi_credentials(&path),
+                last_used_unix_ms: home_last_used(&path),
                 path,
                 metadata,
             });
@@ -542,38 +575,30 @@ fn namespace_list(json: bool) -> Result<()> {
     }
     println!("homes directory: {}", base.display());
     for listing in &listings {
+        let name = listing
+            .path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
         let credentials = if listing.pi_credentials {
             "credentials"
         } else {
             "no credentials"
         };
-        match &listing.metadata {
-            Some(meta) => println!(
-                "{}\t{}\t{}\t{}\t{}",
-                listing
-                    .path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
+        let age = describe_age(listing.last_used_unix_ms);
+        let (kind, repository, manifest) = match &listing.metadata {
+            Some(meta) => (
                 if meta.shared {
                     format!("namespace {}", meta.namespace)
                 } else {
                     "worktree default".to_string()
                 },
-                meta.repository.display(),
-                meta.manifest_name,
-                credentials
+                meta.repository.display().to_string(),
+                meta.manifest_name.clone(),
             ),
-            None => println!(
-                "{}\tlegacy (no metadata)\t?\t?\t{}",
-                listing
-                    .path
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy(),
-                credentials
-            ),
-        }
+            None => ("legacy (no metadata)".to_string(), "?".into(), "?".into()),
+        };
+        println!("{name}\t{kind}\t{repository}\t{manifest}\t{credentials}\t{age}");
     }
     Ok(())
 }
