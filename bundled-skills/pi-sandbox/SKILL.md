@@ -63,6 +63,24 @@ stderr, and `run.json` records `namespace`, `worktree_id`, and
 `persistent_home`. When a worker fails at startup, read that line before
 changing anything else.
 
+## Launcher commands at a glance
+
+| Need | Command |
+| --- | --- |
+| Which home, credentials, and worktrees this checkout resolves to | `pi-sandbox namespace show [--namespace N] [--json]` |
+| Every persistent home on the machine, with credential state and last use | `pi-sandbox namespace list [--json]` |
+| Carry credentials from an older home into the resolved one | `pi-sandbox namespace adopt --from DIR [--force]` |
+| Declare the shared namespace in a new manifest | `pi-sandbox init --namespace NAME ...` |
+| See the image, mounts, home path, and env keys without Docker | `pi-sandbox run --dry-run` or `pi-sandbox exec --dry-run ...` |
+| Run one assignment into an exact fresh directory | `pi-sandbox exec --prompt-file P --output-dir DIR --timeout S -- PI_OPTS` |
+| Run one assignment into an allocated `NAME-NN` directory (retries) | `pi-sandbox exec --prompt-file P --new-run-under BATCH --run-name NAME ...` |
+| Continue a prior conversation in the same worktree | add `--resume-session <path from result.json.session_files>` |
+| Cancel one worker only | `pi-sandbox stop --output-dir DIR --grace 10` |
+
+Prefer `--json` forms when a controller consumes the output. The bundled
+starter's `run_worker` allocates `<output_root>/<name>-NN` itself, so calling
+it twice with the same worker name is a retry, not an error.
+
 ## Implementation ownership
 
 Give each implementation agent end-to-end ownership of its change in one
