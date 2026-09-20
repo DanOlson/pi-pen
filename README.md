@@ -40,12 +40,14 @@ cargo install --path . --force
 ```sh
 pi-sandbox init
 pi-sandbox run [ENV] [--rebuild] [--pull] [network options] [-- <pi args...>]
-pi-sandbox exec [ENV] (--prompt-file PATH | --prompt-stdin) --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
-pi-sandbox rpc [ENV] --output-dir PATH [--timeout SECONDS] [-- <pi options...>]
+pi-sandbox exec [ENV] (--prompt-file PATH | --prompt-stdin) (--output-dir PATH | --new-run-under DIR [--run-name NAME]) [--timeout SECONDS] [-- <pi options...>]
+pi-sandbox rpc [ENV] (--output-dir PATH | --new-run-under DIR [--run-name NAME]) [--timeout SECONDS] [-- <pi options...>]
 pi-sandbox stop --output-dir PATH [--grace SECONDS]
 pi-sandbox build [ENV] [--rebuild] [--pull]
 pi-sandbox env list
 pi-sandbox env show [ENV]
+pi-sandbox namespace show [ENV] [--namespace NAME] [--json]
+pi-sandbox namespace list [--json]
 pi-sandbox skills install [--project-dir PATH] [--link-claude | --no-link-claude] [--force]
 ```
 
@@ -283,8 +285,16 @@ increasing `seq`. `pi_event` envelopes preserve the complete upstream event in
 RPC stdout is not wrapped. A command-acceptance RPC response is not task
 completion, and the RPC process exit status does not summarize every prompt.
 
+Instead of naming an exact directory, `--new-run-under DIR --run-name NAME`
+allocates `DIR/NAME-01`, `DIR/NAME-02`, ... under an existing batch directory
+(creation is the reservation, so concurrent allocators never collide) and prints
+`output_dir: <path>` as the first stderr line. This is the safe way to retry a
+failed worker without editing controller paths.
+
 Each run stores `run.json`, atomic `result.json`, `events.jsonl`, `stderr.log`,
-`response.txt` for exec, and an isolated `sessions/` directory. Directories are
+`response.txt` for exec, and an isolated `sessions/` directory. `run.json`
+records the resolved `namespace`, `worktree_id`, and `persistent_home` so a
+failed start can be traced to the home it used. Directories are
 mode 0700 and artifact files are mode 0600; they can contain source, model output,
 or credentials echoed by tools. `result.json` includes session-file paths for
 explicit follow-up. Its optional `usage` is the final assistant message's
@@ -339,8 +349,34 @@ pi-sandbox run --namespace batch_shared
 pi-sandbox exec --namespace batch_shared --prompt-file /tmp/task.txt --output-dir /tmp/run-1
 ```
 
+For a repository that is always orchestrated the same way, declare the
+namespace once in the manifest so every `run`, `exec`, and `rpc` in any linked
+worktree inherits it without a flag:
+
+```toml
+[run]
+namespace = "myapp_agents"
+```
+
 Provision shared dependencies before parallel work and serialize concurrent
 package-manager writes to the shared home.
+
+Inspect what a worktree resolves to without touching Docker:
+
+```sh
+pi-sandbox namespace show                # this worktree's home, credentials, sharing worktrees
+pi-sandbox namespace show --namespace x  # what an explicit namespace would resolve to
+pi-sandbox namespace list                # every persistent home on this machine
+```
+
+A home is keyed on the repository's Git common directory, the manifest `name`,
+and the namespace; it survives moving or renaming the manifest file. Each home
+carries a `pi-sandbox-home.json` describing those inputs, and `namespace list`
+labels homes created by older releases as `legacy`. Older default homes that
+were keyed on the manifest path are renamed into place automatically the first
+time the new location is needed, so saved credentials carry forward. Headless
+launches print the resolved home and whether it holds pi credentials to stderr,
+and warn when neither the home nor a `*_API_KEY` launch variable supplies any.
 
 The project itself is still mounted separately at `/workspace`.
 For hermetic automation, host-side `PI_SANDBOX_CONFIG_DIR` and

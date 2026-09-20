@@ -50,12 +50,23 @@ pub struct Options {
     pub env: Option<String>,
     pub rebuild: bool,
     pub pull: bool,
-    pub output_dir: PathBuf,
+    pub output_dir: OutputTarget,
     pub timeout: Option<u64>,
     pub resume_session: Option<PathBuf>,
     pub prompt: Option<Prompt>,
     pub pi_args: Vec<String>,
     pub overrides: RunOverrides,
+}
+
+/// Where a run's artifacts go: an exact fresh directory, or a numbered directory
+/// allocated under a batch root so retries never reuse a prior run's path.
+#[derive(Debug)]
+pub enum OutputTarget {
+    Exact(PathBuf),
+    NewRunUnder {
+        batch_dir: PathBuf,
+        run_name: String,
+    },
 }
 
 #[derive(Debug)]
@@ -85,6 +96,12 @@ struct RunRecord {
     pi_compatibility: Option<String>,
     cancellation_requested: bool,
     resume_source: Option<PathBuf>,
+    #[serde(default)]
+    namespace: Option<String>,
+    #[serde(default)]
+    worktree_id: Option<String>,
+    #[serde(default)]
+    persistent_home: Option<PathBuf>,
 }
 
 #[derive(Debug, Serialize)]
@@ -221,14 +238,14 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         .context("environment produced no image")?
         .tag
         .clone();
+    let home_identity = crate::persistent_home_identity(cwd, &resolved, &launch)?;
     if options.overrides.dry_run {
-        crate::launch::print_dry_run(&tag, &launch);
+        crate::launch::print_dry_run(&tag, &launch, &home_identity);
         return Ok(());
     }
-    let requested_output = if options.output_dir.is_absolute() {
-        options.output_dir.clone()
-    } else {
-        cwd.join(&options.output_dir)
+    let requested_output = match &options.output_dir {
+        OutputTarget::Exact(path) => absolute(path, cwd),
+        OutputTarget::NewRunUnder { batch_dir, .. } => absolute(batch_dir, cwd),
     };
     let workspace = launch
         .git
@@ -250,6 +267,7 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         }
     }
     let home = persistent_home_dir_for_run(cwd, &resolved, &launch)?;
+    crate::report_credential_sources(&home_identity, &launch);
     if prospective_output.starts_with(fs::canonicalize(&home).unwrap_or_else(|_| home.clone())) {
         bail!("output directory must be outside the mounted persistent home");
     }
@@ -260,7 +278,17 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         }
     }
     let _worktree_lock = lock_worktree(workspace)?;
-    let output = claim_output(&options.output_dir, cwd)?;
+    let output = match &options.output_dir {
+        OutputTarget::Exact(path) => claim_output(path, cwd)?,
+        OutputTarget::NewRunUnder {
+            batch_dir,
+            run_name,
+        } => {
+            let allocated = allocate_run_dir(&absolute(batch_dir, cwd), run_name)?;
+            eprintln!("output_dir: {}", allocated.display());
+            claim_output(&allocated, cwd)?
+        }
+    };
     let canonical_output = fs::canonicalize(&output)?;
     if canonical_output.starts_with(&canonical_workspace) {
         bail!("output directory resolved inside the mounted workspace");
@@ -306,6 +334,9 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         ),
         cancellation_requested: false,
         resume_source: resume.clone(),
+        namespace: Some(launch.namespace.clone()),
+        worktree_id: Some(launch.worktree_id.clone()),
+        persistent_home: Some(home.clone()),
     };
     write_json_atomic(&output.join("run.json"), &record)?;
     let mut failure_guard = FailureGuard {
@@ -1107,6 +1138,41 @@ fn has_custom_pi_install(resolved: &super::ResolvedEnv, cwd: &Path) -> Result<bo
     };
     let parent = resolve_parent_env(parent, &resolved.source, cwd)?;
     has_custom_pi_install(&parent, cwd)
+}
+
+fn absolute(path: &Path, cwd: &Path) -> PathBuf {
+    if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        cwd.join(path)
+    }
+}
+
+/// Create `<batch_dir>/<run_name>-NN` for the lowest NN not yet taken.
+/// Creation is the reservation, so concurrent allocators never share a path.
+fn allocate_run_dir(batch_dir: &Path, run_name: &str) -> Result<PathBuf> {
+    if run_name.is_empty()
+        || !run_name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        bail!("run name may contain only letters, digits, _ and -");
+    }
+    if !batch_dir.is_dir() {
+        bail!("batch directory does not exist: {}", batch_dir.display());
+    }
+    for index in 1..=9999u32 {
+        let candidate = batch_dir.join(format!("{run_name}-{index:02}"));
+        match fs::create_dir(&candidate) {
+            Ok(()) => return Ok(candidate),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("failed to allocate {}", candidate.display()));
+            }
+        }
+    }
+    bail!("no free run directory under {}", batch_dir.display())
 }
 
 fn claim_output(path: &Path, cwd: &Path) -> Result<PathBuf> {

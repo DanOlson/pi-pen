@@ -100,6 +100,21 @@ pub enum Command {
     Skills {
         command: SkillsCommand,
     },
+    Namespace {
+        command: NamespaceCommand,
+    },
+}
+
+#[derive(Debug)]
+pub enum NamespaceCommand {
+    Show {
+        env: Option<String>,
+        namespace: Option<String>,
+        json: bool,
+    },
+    List {
+        json: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -247,8 +262,9 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 .last()
                 .context("resolved environment did not produce an image")?
                 .tag;
+            let identity = persistent_home_identity(&cli.cwd, &resolved, &launch)?;
             if overrides.dry_run {
-                launch::print_dry_run(tag, &launch);
+                launch::print_dry_run(tag, &launch, &identity);
                 return Ok(());
             }
             launch::preflight_networks(&launch)?;
@@ -284,8 +300,184 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         Command::Skills { command } => match command {
             SkillsCommand::Install(options) => skills::install(&cli.cwd, options)?,
         },
+        Command::Namespace { command } => match command {
+            NamespaceCommand::Show {
+                env,
+                namespace,
+                json,
+            } => namespace_show(&cli.cwd, env.as_deref(), namespace, json)?,
+            NamespaceCommand::List { json } => namespace_list(json)?,
+        },
     }
 
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct NamespaceReport {
+    namespace: String,
+    shared: bool,
+    worktree_id: String,
+    persistent_home: PathBuf,
+    home_exists: bool,
+    pi_credentials: bool,
+    repository: PathBuf,
+    manifest_name: String,
+    manifest_source: String,
+    /// Linked worktrees that resolve to this same home, when the namespace is shared.
+    sharing_worktrees: Vec<PathBuf>,
+}
+
+fn namespace_show(
+    cwd: &Path,
+    env: Option<&str>,
+    namespace: Option<String>,
+    json: bool,
+) -> Result<()> {
+    let resolved = resolve_env(env, cwd)?;
+    let overrides = RunOverrides {
+        namespace,
+        ..RunOverrides::default()
+    };
+    let launch = launch::resolve_run_config(&resolved, cwd, &overrides)?;
+    let identity = persistent_home_identity(cwd, &resolved, &launch)?;
+    let sharing_worktrees = if identity.shared {
+        linked_worktrees(cwd)?
+    } else {
+        Vec::new()
+    };
+    let report = NamespaceReport {
+        namespace: identity.namespace.clone(),
+        shared: identity.shared,
+        worktree_id: identity.worktree_id.clone(),
+        home_exists: identity.path.is_dir(),
+        pi_credentials: home_has_pi_credentials(&identity.path),
+        persistent_home: identity.path.clone(),
+        repository: identity.repository.clone(),
+        manifest_name: identity.manifest_name.clone(),
+        manifest_source: identity.manifest_source.clone(),
+        sharing_worktrees,
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        return Ok(());
+    }
+    println!(
+        "namespace: {} ({})",
+        report.namespace,
+        if report.shared {
+            "explicit, shared by linked worktrees"
+        } else {
+            "worktree default, isolated per worktree"
+        }
+    );
+    println!("worktree_id: {}", report.worktree_id);
+    println!(
+        "persistent home: {} ({})",
+        report.persistent_home.display(),
+        describe_home_state(&report.persistent_home)
+    );
+    println!("repository: {}", report.repository.display());
+    println!(
+        "manifest: {} ({})",
+        report.manifest_name, report.manifest_source
+    );
+    if report.shared {
+        println!("sharing worktrees:");
+        for path in &report.sharing_worktrees {
+            println!("  {}", path.display());
+        }
+    }
+    if !report.pi_credentials {
+        println!("hint: {}", authenticate_hint(&identity));
+    }
+    Ok(())
+}
+
+fn linked_worktrees(cwd: &Path) -> Result<Vec<PathBuf>> {
+    let output = ProcessCommand::new("git")
+        .args(["worktree", "list", "--porcelain"])
+        .current_dir(cwd)
+        .output()
+        .context("failed to run git worktree list")?;
+    if !output.status.success() {
+        return Ok(Vec::new());
+    }
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(|line| line.strip_prefix("worktree "))
+        .map(PathBuf::from)
+        .collect())
+}
+
+#[derive(Debug, Serialize)]
+struct HomeListing {
+    path: PathBuf,
+    pi_credentials: bool,
+    metadata: Option<HomeMetadata>,
+}
+
+fn namespace_list(json: bool) -> Result<()> {
+    let base = homes_dir()?;
+    let mut listings = Vec::new();
+    if base.is_dir() {
+        for entry in
+            fs::read_dir(&base).with_context(|| format!("failed to read {}", base.display()))?
+        {
+            let path = entry?.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let metadata = fs::read(path.join(HOME_METADATA_FILE))
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<HomeMetadata>(&bytes).ok());
+            listings.push(HomeListing {
+                pi_credentials: home_has_pi_credentials(&path),
+                path,
+                metadata,
+            });
+        }
+    }
+    listings.sort_by(|a, b| a.path.cmp(&b.path));
+    if json {
+        println!("{}", serde_json::to_string_pretty(&listings)?);
+        return Ok(());
+    }
+    println!("homes directory: {}", base.display());
+    for listing in &listings {
+        let credentials = if listing.pi_credentials {
+            "credentials"
+        } else {
+            "no credentials"
+        };
+        match &listing.metadata {
+            Some(meta) => println!(
+                "{}\t{}\t{}\t{}\t{}",
+                listing
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                if meta.shared {
+                    format!("namespace {}", meta.namespace)
+                } else {
+                    "worktree default".to_string()
+                },
+                meta.repository.display(),
+                meta.manifest_name,
+                credentials
+            ),
+            None => println!(
+                "{}\tlegacy (no metadata)\t?\t?\t{}",
+                listing
+                    .path
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy(),
+                credentials
+            ),
+        }
+    }
     Ok(())
 }
 
@@ -880,8 +1072,40 @@ pub fn run_invocation(
     }
 }
 
-pub fn persistent_home_dir(cwd: &Path, resolved: &ResolvedEnv) -> Result<PathBuf> {
-    let base = config_dir()?.join("homes");
+/// Resolved identity of a persistent home, computed without touching the filesystem.
+#[derive(Debug, Clone, Serialize)]
+pub struct HomeIdentity {
+    pub path: PathBuf,
+    pub namespace: String,
+    pub worktree_id: String,
+    /// True when the namespace is explicit and therefore shared by linked worktrees.
+    pub shared: bool,
+    pub repository: PathBuf,
+    pub manifest_name: String,
+    pub manifest_source: String,
+}
+
+/// Metadata written into every persistent home so `namespace list` can explain it.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HomeMetadata {
+    pub schema_version: u32,
+    pub namespace: String,
+    pub shared: bool,
+    pub repository: PathBuf,
+    pub manifest_name: String,
+    pub created_at_unix_ms: u128,
+    pub created_from_worktree: PathBuf,
+}
+
+pub const HOME_METADATA_FILE: &str = "pi-sandbox-home.json";
+pub const PI_AUTH_FILE: &str = ".pi/agent/auth.json";
+
+pub fn homes_dir() -> Result<PathBuf> {
+    Ok(config_dir()?.join("homes"))
+}
+
+/// Legacy default-home location keyed on the worktree path, manifest path, and name.
+fn legacy_persistent_home_dir(base: &Path, cwd: &Path, resolved: &ResolvedEnv) -> PathBuf {
     let mut input = cwd.display().to_string();
     input.push('\n');
     input.push_str(&source_fingerprint(&resolved.source));
@@ -889,31 +1113,15 @@ pub fn persistent_home_dir(cwd: &Path, resolved: &ResolvedEnv) -> Result<PathBuf
     input.push_str(resolved.manifest.name.as_deref().unwrap_or("default"));
 
     let name = format!("{}-{:x}", project_slug(cwd), fnv1a64(input.as_bytes()));
-    let path = base.join(name);
-    fs::create_dir_all(&path)
-        .with_context(|| format!("failed to create persistent home {}", path.display()))?;
-    Ok(path)
+    base.join(name)
 }
 
-pub fn persistent_home_dir_for_run(
-    cwd: &Path,
-    resolved: &ResolvedEnv,
-    launch: &ResolvedRunConfig,
-) -> Result<PathBuf> {
-    if launch.namespace == launch.worktree_id {
-        return persistent_home_dir(cwd, resolved);
-    }
-
-    let base = config_dir()?.join("homes");
-    namespace_home_dir(&base, cwd, resolved, launch)
-}
-
-fn namespace_home_dir(
+pub fn resolve_home_identity(
     base: &Path,
     cwd: &Path,
     resolved: &ResolvedEnv,
     launch: &ResolvedRunConfig,
-) -> Result<PathBuf> {
+) -> HomeIdentity {
     let repository_identity = launch
         .git
         .as_ref()
@@ -929,9 +1137,14 @@ fn namespace_home_dir(
     } else {
         &repository_identity
     };
+    let manifest_name = resolved
+        .manifest
+        .name
+        .clone()
+        .unwrap_or_else(|| "default".to_string());
     let mut input = repository_identity.display().to_string();
     input.push('\n');
-    input.push_str(resolved.manifest.name.as_deref().unwrap_or("default"));
+    input.push_str(&manifest_name);
     input.push('\n');
     input.push_str(&launch.namespace);
 
@@ -941,10 +1154,120 @@ fn namespace_home_dir(
         launch.namespace,
         fnv1a64(input.as_bytes())
     );
-    let path = base.join(name);
-    fs::create_dir_all(&path)
+    HomeIdentity {
+        path: base.join(name),
+        namespace: launch.namespace.clone(),
+        worktree_id: launch.worktree_id.clone(),
+        shared: launch.namespace != launch.worktree_id,
+        repository: repository_root.to_path_buf(),
+        manifest_name,
+        manifest_source: source_fingerprint(&resolved.source),
+    }
+}
+
+pub fn persistent_home_identity(
+    cwd: &Path,
+    resolved: &ResolvedEnv,
+    launch: &ResolvedRunConfig,
+) -> Result<HomeIdentity> {
+    Ok(resolve_home_identity(&homes_dir()?, cwd, resolved, launch))
+}
+
+pub fn persistent_home_dir_for_run(
+    cwd: &Path,
+    resolved: &ResolvedEnv,
+    launch: &ResolvedRunConfig,
+) -> Result<PathBuf> {
+    let base = homes_dir()?;
+    let identity = resolve_home_identity(&base, cwd, resolved, launch);
+    ensure_home(&base, cwd, resolved, &identity)
+}
+
+fn ensure_home(
+    base: &Path,
+    cwd: &Path,
+    resolved: &ResolvedEnv,
+    identity: &HomeIdentity,
+) -> Result<PathBuf> {
+    let path = &identity.path;
+    if !path.exists() && !identity.shared {
+        // Default homes were once keyed on the worktree and manifest path. Carry
+        // credentials forward once instead of silently starting from an empty home.
+        let legacy = legacy_persistent_home_dir(base, cwd, resolved);
+        if legacy.is_dir() && fs::rename(&legacy, path).is_ok() {
+            eprintln!(
+                "migrated persistent home {} -> {}",
+                legacy.display(),
+                path.display()
+            );
+        }
+    }
+    fs::create_dir_all(path)
         .with_context(|| format!("failed to create persistent home {}", path.display()))?;
-    Ok(path)
+    let metadata = path.join(HOME_METADATA_FILE);
+    if !metadata.exists() {
+        let record = HomeMetadata {
+            schema_version: 1,
+            namespace: identity.namespace.clone(),
+            shared: identity.shared,
+            repository: identity.repository.clone(),
+            manifest_name: identity.manifest_name.clone(),
+            created_at_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0),
+            created_from_worktree: fs::canonicalize(cwd).unwrap_or_else(|_| cwd.to_path_buf()),
+        };
+        let json = serde_json::to_vec_pretty(&record)?;
+        fs::write(&metadata, json)
+            .with_context(|| format!("failed to write {}", metadata.display()))?;
+    }
+    Ok(path.clone())
+}
+
+pub fn home_has_pi_credentials(home: &Path) -> bool {
+    home.join(PI_AUTH_FILE).is_file()
+}
+
+/// Short human-readable state of a persistent home for diagnostics.
+pub fn describe_home_state(home: &Path) -> &'static str {
+    if !home.is_dir() {
+        "not created yet"
+    } else if home_has_pi_credentials(home) {
+        "pi credentials present"
+    } else {
+        "no pi credentials"
+    }
+}
+
+/// The interactive command that would authenticate this home.
+pub fn authenticate_hint(identity: &HomeIdentity) -> String {
+    if identity.shared {
+        format!(
+            "authenticate once with `pi-sandbox run --namespace {}` (or set `[run] namespace` in the manifest), or pass --env-file",
+            identity.namespace
+        )
+    } else {
+        "authenticate once with `pi-sandbox run` in this worktree; to share credentials across linked worktrees, set `[run] namespace` in the manifest and authenticate that namespace instead, or pass --env-file".to_string()
+    }
+}
+
+/// Explain on stderr where credentials will come from, before launching a worker.
+/// Missing credentials are not fatal here: an env file or manifest may supply them.
+pub fn report_credential_sources(identity: &HomeIdentity, launch: &ResolvedRunConfig) {
+    let has_api_key_env = launch.env.keys().any(|key| key.ends_with("_API_KEY"));
+    eprintln!(
+        "persistent home: {} (namespace {}, {})",
+        identity.path.display(),
+        launch.namespace,
+        describe_home_state(&identity.path)
+    );
+    if !home_has_pi_credentials(&identity.path) && !has_api_key_env {
+        eprintln!(
+            "warning: no saved pi credentials in the persistent home and no *_API_KEY launch variable; {}",
+            authenticate_hint(identity)
+        );
+    }
 }
 
 pub fn seed_git_config(home: &Path, git: Option<&GitConfig>) -> Result<()> {
@@ -1806,42 +2129,138 @@ mod tests {
             }),
         };
 
-        let first = namespace_home_dir(
-            &base,
+        let home = |cwd: &Path, resolved: &ResolvedEnv, launch: &ResolvedRunConfig| {
+            let identity = resolve_home_identity(&base, cwd, resolved, launch);
+            ensure_home(&base, cwd, resolved, &identity).unwrap()
+        };
+        let first = home(
             &first_worktree,
             &resolved,
             &config(&first_worktree, "wt_first", "orchestration"),
-        )
-        .unwrap();
-        let second = namespace_home_dir(
-            &base,
+        );
+        let second = home(
             &second_worktree,
             &resolved,
             &config(&second_worktree, "wt_second", "orchestration"),
-        )
-        .unwrap();
-        let explicitly_selected = namespace_home_dir(
-            &base,
+        );
+        let explicitly_selected = home(
             &second_worktree,
             &ResolvedEnv {
                 source: EnvSource::Explicit(repository.join(".pi-env.toml")),
                 manifest: resolved.manifest.clone(),
             },
             &config(&second_worktree, "wt_second", "orchestration"),
-        )
-        .unwrap();
-        let isolated = namespace_home_dir(
-            &base,
+        );
+        let isolated = home(
             &second_worktree,
             &resolved,
             &config(&second_worktree, "wt_second", "other"),
-        )
-        .unwrap();
+        );
+        let default_first = home(
+            &first_worktree,
+            &resolved,
+            &config(&first_worktree, "wt_first", "wt_first"),
+        );
+        let default_second = home(
+            &second_worktree,
+            &resolved,
+            &config(&second_worktree, "wt_second", "wt_second"),
+        );
 
         assert_eq!(first, second);
         assert_eq!(first, explicitly_selected);
         assert_ne!(first, isolated);
+        assert_ne!(default_first, default_second);
+        assert_ne!(default_first, first);
         assert!(first.is_dir());
+
+        let metadata: HomeMetadata =
+            serde_json::from_slice(&fs::read(first.join(HOME_METADATA_FILE)).unwrap()).unwrap();
+        assert_eq!(metadata.namespace, "orchestration");
+        assert!(metadata.shared);
+        assert_eq!(metadata.manifest_name, "app");
+        let default_metadata: HomeMetadata =
+            serde_json::from_slice(&fs::read(default_first.join(HOME_METADATA_FILE)).unwrap())
+                .unwrap();
+        assert!(!default_metadata.shared);
+    }
+
+    #[test]
+    fn default_home_keys_on_repository_and_survives_manifest_moves() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("homes");
+        let worktree = dir.path().join("repo");
+        let common = worktree.join(".git");
+        fs::create_dir_all(&common).unwrap();
+        let manifest = EnvManifest {
+            name: Some("app".into()),
+            ..EnvManifest::default()
+        };
+        let launch = ResolvedRunConfig {
+            networks: Vec::new(),
+            host_access: HostAccess::Default,
+            namespace: "wt_repo".into(),
+            worktree_id: "wt_repo".into(),
+            env: BTreeMap::new(),
+            git: Some(launch::GitMounts {
+                worktree_root: worktree.clone(),
+                workspace_cwd: PathBuf::new(),
+                git_dir: common.clone(),
+                common_dir: common.clone(),
+                separate_git_dir: false,
+            }),
+        };
+        let project = ResolvedEnv {
+            source: EnvSource::Project(worktree.join(PROJECT_MANIFEST)),
+            manifest: manifest.clone(),
+        };
+        let explicit = ResolvedEnv {
+            source: EnvSource::Explicit(dir.path().join("elsewhere.toml")),
+            manifest,
+        };
+
+        let from_project = resolve_home_identity(&base, &worktree, &project, &launch);
+        let from_explicit = resolve_home_identity(&base, &worktree, &explicit, &launch);
+        assert_eq!(from_project.path, from_explicit.path);
+        assert!(!from_project.shared);
+        assert!(
+            !base.exists(),
+            "identity resolution must not create directories"
+        );
+    }
+
+    #[test]
+    fn default_home_migrates_legacy_directory_once() {
+        let dir = tempdir().unwrap();
+        let base = dir.path().join("homes");
+        let worktree = dir.path().join("repo");
+        fs::create_dir_all(worktree.join(".git")).unwrap();
+        let resolved = ResolvedEnv {
+            source: EnvSource::Project(worktree.join(PROJECT_MANIFEST)),
+            manifest: EnvManifest {
+                name: Some("app".into()),
+                ..EnvManifest::default()
+            },
+        };
+        let launch = ResolvedRunConfig {
+            networks: Vec::new(),
+            host_access: HostAccess::Default,
+            namespace: "wt_repo".into(),
+            worktree_id: "wt_repo".into(),
+            env: BTreeMap::new(),
+            git: None,
+        };
+        let legacy = legacy_persistent_home_dir(&base, &worktree, &resolved);
+        fs::create_dir_all(legacy.join(".pi/agent")).unwrap();
+        fs::write(legacy.join(PI_AUTH_FILE), b"{}").unwrap();
+
+        let identity = resolve_home_identity(&base, &worktree, &resolved, &launch);
+        let home = ensure_home(&base, &worktree, &resolved, &identity).unwrap();
+
+        assert_ne!(home, legacy);
+        assert!(!legacy.exists());
+        assert!(home_has_pi_credentials(&home));
+        assert!(home.join(HOME_METADATA_FILE).is_file());
     }
 
     #[test]

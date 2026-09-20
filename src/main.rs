@@ -47,6 +47,35 @@ enum Command {
         #[command(subcommand)]
         command: SkillsCommand,
     },
+    /// Inspect persistent home namespaces without launching Docker.
+    Namespace {
+        #[command(subcommand)]
+        command: NamespaceCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum NamespaceCommand {
+    /// Show the persistent home this worktree and environment resolve to.
+    Show(NamespaceShowArgs),
+    /// List every persistent home known to this machine.
+    List {
+        /// Print JSON instead of a table.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Debug, Args)]
+struct NamespaceShowArgs {
+    /// Environment name or manifest path.
+    env: Option<String>,
+    /// Namespace to resolve instead of the manifest or worktree default.
+    #[arg(long)]
+    namespace: Option<String>,
+    /// Print JSON instead of text.
+    #[arg(long)]
+    json: bool,
 }
 
 #[derive(Debug, Args)]
@@ -138,8 +167,8 @@ struct ExecArgs {
         required_unless_present = "prompt_file"
     )]
     prompt_stdin: bool,
-    #[arg(long)]
-    output_dir: PathBuf,
+    #[command(flatten)]
+    output: OutputArgs,
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: Option<u64>,
     #[arg(long)]
@@ -157,14 +186,44 @@ struct RpcArgs {
     pull: bool,
     #[command(flatten)]
     launch: pi_sandbox::LaunchArgs,
-    #[arg(long)]
-    output_dir: PathBuf,
+    #[command(flatten)]
+    output: OutputArgs,
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..))]
     timeout: Option<u64>,
     #[arg(long)]
     resume_session: Option<PathBuf>,
     #[arg(last = true)]
     pi_args: Vec<String>,
+}
+
+#[derive(Debug, Args)]
+struct OutputArgs {
+    /// Fresh directory for this run's artifacts.
+    #[arg(
+        long,
+        required_unless_present = "new_run_under",
+        conflicts_with = "new_run_under"
+    )]
+    output_dir: Option<PathBuf>,
+    /// Allocate a numbered `<run-name>-NN` directory under this existing batch directory.
+    #[arg(long)]
+    new_run_under: Option<PathBuf>,
+    /// Name prefix for an allocated run directory.
+    #[arg(long, default_value = "run", requires = "new_run_under")]
+    run_name: String,
+}
+
+impl From<OutputArgs> for pi_sandbox::headless::OutputTarget {
+    fn from(args: OutputArgs) -> Self {
+        match (args.output_dir, args.new_run_under) {
+            (Some(path), _) => Self::Exact(path),
+            (None, Some(batch_dir)) => Self::NewRunUnder {
+                batch_dir,
+                run_name: args.run_name,
+            },
+            (None, None) => unreachable!("clap requires one output target"),
+        }
+    }
 }
 
 #[derive(Debug, Args)]
@@ -252,7 +311,7 @@ impl From<Cli> for pi_sandbox::Cli {
                         env: args.env,
                         rebuild: args.rebuild,
                         pull: args.pull,
-                        output_dir: args.output_dir,
+                        output_dir: args.output.into(),
                         timeout: args.timeout,
                         resume_session: args.resume_session,
                         prompt: Some(if let Some(path) = args.prompt_file {
@@ -269,7 +328,7 @@ impl From<Cli> for pi_sandbox::Cli {
                         env: args.env,
                         rebuild: args.rebuild,
                         pull: args.pull,
-                        output_dir: args.output_dir,
+                        output_dir: args.output.into(),
                         timeout: args.timeout,
                         resume_session: args.resume_session,
                         prompt: None,
@@ -283,6 +342,18 @@ impl From<Cli> for pi_sandbox::Cli {
                         grace: args.grace,
                     })
                 }
+                Command::Namespace { command } => pi_sandbox::Command::Namespace {
+                    command: match command {
+                        NamespaceCommand::Show(args) => pi_sandbox::NamespaceCommand::Show {
+                            env: args.env,
+                            namespace: args.namespace,
+                            json: args.json,
+                        },
+                        NamespaceCommand::List { json } => {
+                            pi_sandbox::NamespaceCommand::List { json }
+                        }
+                    },
+                },
                 Command::Skills { command } => pi_sandbox::Command::Skills {
                     command: match command {
                         SkillsCommand::Install(args) => {

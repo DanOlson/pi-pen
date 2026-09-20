@@ -670,9 +670,17 @@ pub fn preflight_networks(config: &ResolvedRunConfig) -> Result<()> {
     Ok(())
 }
 
-pub fn print_dry_run(image: &str, config: &ResolvedRunConfig) {
+pub fn print_dry_run(image: &str, config: &ResolvedRunConfig, home: &crate::HomeIdentity) {
     println!("image: {image}");
-    println!("namespace: {}", config.namespace);
+    println!(
+        "namespace: {} ({})",
+        config.namespace,
+        if home.shared {
+            "explicit, shared by linked worktrees"
+        } else {
+            "worktree default, isolated"
+        }
+    );
     println!("worktree_id: {}", config.worktree_id);
     println!("host_access: {:?}", config.host_access);
     println!(
@@ -699,7 +707,11 @@ pub fn print_dry_run(image: &str, config: &ResolvedRunConfig) {
             );
         }
     }
-    println!("persistent home mount: <created on real run> -> /tmp/pi-home");
+    println!(
+        "persistent home mount: {} -> /tmp/pi-home ({})",
+        home.path.display(),
+        crate::describe_home_state(&home.path)
+    );
     println!("environment (values redacted):");
     for (key, variable) in &config.env {
         println!("  {key}=<redacted> ({:?})", variable.provenance);

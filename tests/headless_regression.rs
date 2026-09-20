@@ -97,6 +97,23 @@ esac
     }
 
     fn command_with_timeout(&self, case: &str, timeout: &str) -> Command {
+        let mut command = self.exec_without_output(case, timeout);
+        command.arg("--output-dir").arg(&self.output);
+        command
+    }
+
+    /// An exec invocation with everything but an output target, for tests that pick one.
+    fn exec_without_output(&self, case: &str, timeout: &str) -> Command {
+        let mut command = self.base_command(case);
+        command
+            .args(["exec", "--prompt-file"])
+            .arg(self.root.path().join("prompt.txt"))
+            .args(["--timeout", timeout]);
+        command
+    }
+
+    /// The launcher with the fixture's fake Docker and private config/cache, no subcommand.
+    fn base_command(&self, case: &str) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_pi-sandbox"));
         command
             .current_dir(&self.workspace)
@@ -116,11 +133,6 @@ esac
             .env("TEST_DOCKER_LOG", self.root.path().join("docker.log"))
             .env_remove("DOCKER_HOST")
             .env_remove("DOCKER_CONTEXT")
-            .args(["exec", "--prompt-file"])
-            .arg(self.root.path().join("prompt.txt"))
-            .arg("--output-dir")
-            .arg(&self.output)
-            .args(["--timeout", timeout])
             .stdin(Stdio::null());
         command
     }
@@ -414,4 +426,112 @@ fn inherited_context_pipe_obeys_overall_timeout() {
     assert!(started.elapsed() < Duration::from_secs(8));
     assert_eq!(fixture.result()["wrapper_exit_code"], 124);
     assert_eq!(fixture.result()["status"], "timed_out");
+}
+
+#[test]
+fn run_record_names_namespace_and_persistent_home_and_warns_without_credentials() {
+    let fixture = Fixture::new();
+    let output = bounded_output(fixture.command("success"));
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("persistent home: "), "{stderr}");
+    assert!(stderr.contains("no saved pi credentials"), "{stderr}");
+    let record: Value =
+        serde_json::from_slice(&fs::read(fixture.output.join("run.json")).unwrap()).unwrap();
+    let home = PathBuf::from(record["persistent_home"].as_str().unwrap());
+    assert!(home.starts_with(fixture.root.path().join("config")));
+    assert!(home.join("pi-sandbox-home.json").is_file());
+    let namespace = record["namespace"].as_str().unwrap();
+    assert_eq!(namespace, record["worktree_id"].as_str().unwrap());
+    assert!(namespace.starts_with("wt_"));
+}
+
+#[test]
+fn saved_credentials_or_api_key_variables_silence_the_warning() {
+    let fixture = Fixture::new();
+    let mut command = fixture.exec_without_output("success", "5");
+    command
+        .arg("--output-dir")
+        .arg(fixture.root.path().join("with-key"))
+        .args(["--env", "OPENAI_API_KEY=not-a-real-key"]);
+    let output = bounded_output(command);
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(!stderr.contains("no saved pi credentials"), "{stderr}");
+}
+
+#[test]
+fn new_run_under_allocates_numbered_directories() {
+    let fixture = Fixture::new();
+    let batch = fixture.root.path().join("batch");
+    fs::create_dir(&batch).unwrap();
+    for expected in ["review-01", "review-02"] {
+        let mut command = fixture.exec_without_output("success", "5");
+        command
+            .arg("--new-run-under")
+            .arg(&batch)
+            .args(["--run-name", "review"]);
+        let output = bounded_output(command);
+        assert!(
+            output.status.success(),
+            "{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let allocated = batch.join(expected);
+        assert!(
+            stderr
+                .lines()
+                .any(|line| line == format!("output_dir: {}", allocated.display())),
+            "{stderr}"
+        );
+        let result: Value =
+            serde_json::from_slice(&fs::read(allocated.join("result.json")).unwrap()).unwrap();
+        assert_eq!(result["status"], "completed");
+    }
+    let mut command = fixture.exec_without_output("success", "5");
+    command
+        .arg("--new-run-under")
+        .arg(fixture.root.path().join("absent"));
+    let missing = bounded_output(command);
+    assert!(!missing.status.success());
+    assert!(String::from_utf8_lossy(&missing.stderr).contains("batch directory does not exist"));
+}
+
+#[test]
+fn dry_run_and_namespace_show_report_the_same_home() {
+    let fixture = Fixture::new();
+    let mut command = fixture.command("success");
+    command.args(["--dry-run", "--namespace", "batch_shared"]);
+    let dry = bounded_output(command);
+    assert!(
+        dry.status.success(),
+        "{}",
+        String::from_utf8_lossy(&dry.stderr)
+    );
+    let dry_stdout = String::from_utf8_lossy(&dry.stdout);
+    let home_line = dry_stdout
+        .lines()
+        .find(|line| line.starts_with("persistent home mount: "))
+        .unwrap();
+    assert!(!home_line.contains("<created on real run>"));
+    assert!(home_line.contains("batch_shared"));
+    assert!(home_line.contains("not created yet"));
+
+    let mut show = fixture.base_command("success");
+    show.args(["namespace", "show", "--namespace", "batch_shared", "--json"]);
+    let show_out = bounded_output(show);
+    assert!(
+        show_out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&show_out.stderr)
+    );
+    let report: Value = serde_json::from_slice(&show_out.stdout).unwrap();
+    assert_eq!(report["namespace"], "batch_shared");
+    assert_eq!(report["shared"], true);
+    assert_eq!(report["home_exists"], false);
+    assert_eq!(report["pi_credentials"], false);
+    let home = report["persistent_home"].as_str().unwrap();
+    assert!(home_line.contains(home));
+    assert!(!fixture.root.path().join("config/homes").exists());
 }
