@@ -335,6 +335,8 @@ to `/tmp/pi-home/.gitconfig`.
   config, npm, and cargo when users want to share existing host credentials
   with the container.
 
+Larger, not-yet-scheduled ideas live in [docs/roadmap.md](docs/roadmap.md).
+
 ## Persistent Home
 
 `pi-sandbox run` creates a persistent home directory under the platform config
