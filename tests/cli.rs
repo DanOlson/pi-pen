@@ -518,6 +518,8 @@ fn init_with_tauri_writes_preset_manifest() {
     assert!(manifest.contains("libwebkit2gtk-4.1-dev"));
     assert!(manifest.contains("/opt/cargo/bin"));
     assert!(manifest.contains("[runtime_env]"));
+    assert!(manifest.contains("[run.env]"));
+    assert!(manifest.contains("CARGO_TARGET_DIR = \"/tmp/pi-home/.cache/cargo-target\""));
 }
 
 #[test]

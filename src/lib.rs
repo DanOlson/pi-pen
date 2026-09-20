@@ -52,6 +52,9 @@ const RUSTUP_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -sSf https://sh.ru
 const RUST_COMPONENTS_COMMAND: &str = "CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/cargo/bin/rustup component add rustfmt clippy";
 const RUST_PERMISSIONS_COMMAND: &str = "chmod -R a+rX /opt/cargo /opt/rustup";
 const UV_VERSION: &str = "0.12.0";
+/// Shared build cache inside the persistent home so linked worktrees using one
+/// namespace reuse a single compiled graph instead of rebuilding per worktree.
+const RUST_TARGET_DIR: &str = "/tmp/pi-home/.cache/cargo-target";
 const RAILS_RUBY_IMAGE: &str = "ruby:4.0.1-bookworm";
 const RAILS_BASE_STAGE: &str = "rails-ruby-node";
 const RAILS_NODE_STAGE: &str = "pi-node-runtime";
@@ -658,6 +661,12 @@ fn apply_presets(manifest: &mut EnvManifest, presets: &[String]) -> Result<()> {
                 manifest
                     .runtime_env
                     .insert("PATH".to_string(), RUST_PATH.to_string());
+                manifest
+                    .run
+                    .get_or_insert_with(RunConfig::default)
+                    .env
+                    .entry("CARGO_TARGET_DIR".to_string())
+                    .or_insert_with(|| RUST_TARGET_DIR.to_string());
             }
             "rails" => {
                 if manifest.extends.is_some() {
@@ -1845,6 +1854,14 @@ mod tests {
         assert_eq!(
             manifest.runtime_env.get("PATH").map(String::as_str),
             Some(RUST_PATH)
+        );
+        assert_eq!(
+            manifest
+                .run
+                .as_ref()
+                .and_then(|run| run.env.get("CARGO_TARGET_DIR"))
+                .map(String::as_str),
+            Some(RUST_TARGET_DIR)
         );
     }
 

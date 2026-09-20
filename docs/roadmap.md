@@ -42,14 +42,6 @@ to report progress; or a hung worker goes unnoticed because nothing surfaced
 the elapsed time of its last tool call. Until then the `jq` filter in the
 skill's orchestration reference covers most of the need.
 
-## `init --with rust|tauri` emitting a shared `CARGO_TARGET_DIR`
-
-Each fresh worktree recompiles the full graph because `target/` is
-worktree-local. Pointing `CARGO_TARGET_DIR` into the shared namespace home
-(documented in the skill) fixes it with no launcher change. Open question is
-whether the presets should emit it by default or as a commented line, given
-that one worker running `cargo clean` empties the cache for everyone.
-
 ## Declarative `pi-sandbox orchestrate --jobs jobs.json`
 
 Stages with `depends_on`, replacing a bespoke Python controller per task.

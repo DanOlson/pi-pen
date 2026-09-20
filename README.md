@@ -124,7 +124,10 @@ Stack presets expand into plain manifest content:
   image for `pi` and asset tooling, add PostgreSQL, SQLite, and libvips
   dependencies, and persist installed bundle gems in the project home.
 - `rust`: install Rust under `/opt/cargo` and `/opt/rustup`, add `rustfmt`
-  and `clippy`, and set runtime Cargo/Rust environment.
+  and `clippy`, set runtime Cargo/Rust environment, and point
+  `CARGO_TARGET_DIR` at `/tmp/pi-home/.cache/cargo-target` so every worker in
+  a shared namespace reuses one build cache instead of recompiling per
+  worktree. Remove that `[run.env]` line to keep `target/` in the workspace.
 - `tauri`: includes `node` and `rust`, then adds common Tauri v2 Linux build
   dependencies.
 
