@@ -13,6 +13,10 @@ const CLAUDE_LINK_TARGET: &str = "../../.agents/skills/pi-sandbox";
 
 const BUNDLE: &[(&str, &str)] = &[
     (
+        ".gitignore",
+        include_str!("../bundled-skills/pi-sandbox/.gitignore"),
+    ),
+    (
         "SKILL.md",
         include_str!("../bundled-skills/pi-sandbox/SKILL.md"),
     ),

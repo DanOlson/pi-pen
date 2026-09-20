@@ -20,6 +20,59 @@ implementer has committed, create the reviewer's worktree with
 `git worktree add --detach <review-path> <sha>`. Verify it with
 `git -C <review-path> rev-parse HEAD` before launching the reviewer.
 
+## Worktree plus shared namespace, end to end
+
+This is the complete sequence for one implementer and one reviewer once the
+namespace in `SKILL.md` is set up and authenticated. Paths are examples.
+
+```text
+# Once per batch, from the main checkout.
+pi-sandbox namespace show                      # must say: pi credentials present
+pi-sandbox build                               # so workers reuse one image
+mkdir -p -m 0700 /private/tmp/batch-42
+BASE=$(git rev-parse HEAD)
+
+# Implementer: its own branch and worktree.
+git worktree add -b agents/feature-42 /private/tmp/wt-implement "$BASE"
+pi-sandbox exec --prompt-file /private/tmp/batch-42/implement.prompt \
+  --new-run-under /private/tmp/batch-42 --run-name implement --timeout 1800 \
+  -- --provider PROVIDER --model MODEL
+# (run from /private/tmp/wt-implement; the controller sets cwd)
+
+# Reviewer: detached at the exact commit the implementer reported.
+SHA=$(git -C /private/tmp/wt-implement rev-parse HEAD)
+git worktree add --detach /private/tmp/wt-review "$SHA"
+git -C /private/tmp/wt-review rev-parse HEAD        # confirm == $SHA
+pi-sandbox exec --prompt-file /private/tmp/batch-42/review.prompt \
+  --new-run-under /private/tmp/batch-42 --run-name review --timeout 1800 \
+  -- --provider PROVIDER --model MODEL --tools read,bash
+# (run from /private/tmp/wt-review)
+
+# Revision: resume the implementer in its original worktree.
+pi-sandbox exec --prompt-file /private/tmp/batch-42/revise.prompt \
+  --resume-session /private/tmp/batch-42/implement-01/sessions/session.jsonl \
+  --new-run-under /private/tmp/batch-42 --run-name implement --timeout 1800 \
+  -- --provider PROVIDER --model MODEL
+```
+
+Because the namespace is declared in the manifest, none of these commands need
+`--namespace`; all of them mount the same authenticated home. If the manifest
+does not declare one, pass the same `--namespace NAME` to every command above.
+
+Build artifacts are worktree-local: `target/`, `node_modules/`, and similar
+directories are not shared through the home, so each fresh worktree rebuilds
+from scratch. For Rust projects, point `CARGO_TARGET_DIR` into the shared home
+from the manifest so every worker reuses one compiled graph; Cargo's build lock
+serializes concurrent access:
+
+```toml
+[run.env]
+CARGO_TARGET_DIR = "/tmp/pi-home/.cache/cargo-target"
+```
+
+Tell workers not to run `cargo clean` or delete cache directories when a cache
+is shared.
+
 ## Worktree and branch rules
 
 - Record the base commit before starting.
@@ -36,6 +89,9 @@ implementer has committed, create the reviewer's worktree with
   `completed`.
 - Preserve unrelated pre-existing changes and make the integration action
   explicit: merge, cherry-pick, request another revision, or stop.
+- A worker's `git status` describes its own worktree. Ignored or untracked
+  build directories a reviewer deletes inside its container do not affect the
+  host checkout; verify host state from the host, not from a worker's report.
 
 ## Task-specific controller
 
@@ -52,14 +108,39 @@ outside all worker worktrees and place run artifacts there. It should:
 - stop before destructive integration or external side effects that were not
   authorized.
 
-Use `assets/orchestrator.py` as a starter for worker execution. Adapt its main
-flow to the task instead of rebuilding process supervision from scratch. The
+Copy `assets/orchestrator.py` beside the controller and import it from there.
+Importing it in place from the installed skill directory is also fine, but set
+`sys.dont_write_bytecode = True` (or `PYTHONDONTWRITEBYTECODE=1`) before the
+import so no `__pycache__` lands in the checked-out skill. Adapt its main flow
+to the task instead of rebuilding process supervision from scratch. The
 controller may use `exec` for each stage and `--resume-session` for implementer
 revisions. Use RPC only when live steering materially improves the workflow.
+
+## Monitoring a running worker
+
+`events.jsonl` is a durable protocol log, not a progress view: it is dominated
+by token deltas and partial tool output. To see where a worker is, read
+`run.json` for `state` and `container_id`, then filter events by type:
+
+```text
+jq -c 'select(.type=="pi_event") | .event | select(.type|test("^(tool_execution_(start|end)|turn_|agent_)")) | {type, tool: .toolName, args: .args.command}' OUTPUT/events.jsonl | tail -n 5
+```
+
+`response.txt` and `result.json` appear only at the end; their absence means
+the worker is still running or the launcher died. If `stderr.log` is quiet and
+`run.json` has not been updated for longer than a tool call should take, use
+`docker inspect <container_id>` before deciding the worker is stuck.
 
 ## Failure handling
 
 Reconcile the filesystem, Git branch, recorded commit, result, and cleanup state
 before deciding what to do after a failure. A safe retry has a new output
-directory and a prompt that explains the observed state. Bound retries and
-escalate recurring failures rather than looping indefinitely.
+directory and a prompt that explains the observed state; `--new-run-under
+BATCH --run-name NAME` allocates `NAME-02`, `NAME-03`, ... without editing
+controller paths, and prints the chosen path as the first stderr line. Bound
+retries and escalate recurring failures rather than looping indefinitely.
+
+A startup failure that mentions credentials or a missing API key is a namespace
+problem, not a retry candidate: check the `persistent home:` line the launcher
+printed, compare it with `pi-sandbox namespace show`, and fix the namespace
+before launching again.

@@ -7,11 +7,15 @@
 - Supply credentials and other runtime variables explicitly as described below.
   Host environment variables are not forwarded automatically.
 - For persisted Pi/OAuth credentials or home-installed project dependencies
-  shared by linked worktrees, choose one explicit `--namespace NAME` and pass it
-  to the initial interactive setup and every worker. The default `worktree`
-  namespace intentionally gives each worktree a separate persistent home.
+  shared by linked worktrees, use one explicit namespace: declare it as
+  `[run] namespace` in the manifest (preferred, inherited by every launch) or
+  pass the same `--namespace NAME` to the initial interactive setup and every
+  worker. The default `worktree` namespace intentionally gives each worktree a
+  separate persistent home. Confirm with `pi-sandbox namespace show` before a
+  batch; it reports the resolved home path and whether it holds credentials.
 - Give every invocation a fresh output directory outside the workspace,
-  persistent home, and Git metadata mounts.
+  persistent home, and Git metadata mounts: either an exact `--output-dir`, or
+  `--new-run-under BATCH --run-name NAME` to allocate `BATCH/NAME-NN`.
 - Use an explicit timeout for unattended work.
 
 ## One-shot worker
@@ -82,8 +86,9 @@ mount. Authenticate and provision the namespace once, for example:
 pi-sandbox run --namespace feature_orchestrator
 ```
 
-Then pass `--namespace feature_orchestrator` to every `exec` or `rpc` worker.
-Linked worktrees in the same repository and environment will share Pi's
+Then pass `--namespace feature_orchestrator` to every `exec` or `rpc` worker,
+or declare it once as `[run] namespace = "feature_orchestrator"` in the
+manifest so it is inherited. Linked worktrees in the same repository and environment will share Pi's
 persisted provider credentials, Ruby gems installed under the home, npm and
 other package caches, and tool configuration. Unrelated repositories do not
 share a home merely because they use the same namespace name. Headless session
@@ -94,6 +99,11 @@ The Python starter accepts the same value as `namespace="feature_orchestrator"`.
 Drain stdout and stderr concurrently. A worker can fail if stdout remains
 blocked, and unread stderr can deadlock a subprocess. Regular files are a simple
 safe destination for unattended runs and may contain sensitive material.
+
+Each headless launch prints `persistent home: <path> (namespace <name>, ...)`
+to stderr before starting Docker, and `run.json` records `namespace`,
+`worktree_id`, and `persistent_home`. A warning on that line means the home
+has no saved credentials and no `*_API_KEY` launch variable was supplied.
 
 ## Completion
 

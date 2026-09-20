@@ -49,7 +49,10 @@ Prompts must be nonempty UTF-8, at most 8 MiB.
 
 Each output directory must be new or empty, with an existing parent, and outside
 all container mounts: workspace, persistent home, and Git metadata. Never reuse
-an old run directory. The launcher validates these boundaries.
+an old run directory. The launcher validates these boundaries. To let the
+launcher pick the directory, pass `--new-run-under /tmp/pi-runs --run-name task`
+instead of `--output-dir`; it creates `task-01`, `task-02`, ... and prints the
+chosen path as the first stderr line.
 
 ## Parallel worktrees
 
@@ -92,7 +95,10 @@ The batch root must not already exist; its parent must exist.
 A named namespace also selects a persistent home shared by linked worktrees in
 the same repository and environment. Initialize provider authentication or
 home-installed dependencies once with `pi-sandbox run --namespace batch_shared`,
-then give the example the same namespace. Because that home includes mutable
+then give the example the same namespace. Declaring `[run] namespace =
+"batch_shared"` in the manifest makes every launch inherit it instead. Check
+what a worktree resolves to, and whether that home holds credentials, with
+`pi-sandbox namespace show`. Because that home includes mutable
 package caches and install locations, complete dependency provisioning before
 parallel work and serialize package-manager writes to shared state.
 

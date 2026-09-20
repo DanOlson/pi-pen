@@ -42,6 +42,20 @@ reproduction or test evidence where possible. The reviewer may run tests but
 should not edit or commit. Ask it to state explicitly when it found no issues
 and to identify residual testing gaps.
 
+Make the read-only boundary concrete. Launch reviewers with
+`-- --tools read,bash` so they have no edit or write tool, and include:
+
+```text
+Do not modify, delete, clean, or rebuild anything outside normal test runs:
+no `cargo clean`, no removing build or cache directories, no `git checkout`
+or `git stash`. Build caches may be shared with other workers. Report
+`git status --porcelain` and `git rev-parse HEAD` at the start and end; if
+they differ, say what changed and why.
+```
+
+A reviewer's view of untracked or ignored files is its own worktree's, not the
+host's; the orchestrator verifies host state from the host.
+
 ## Revision assignment
 
 Resume the implementation session in its original worktree. Include the review

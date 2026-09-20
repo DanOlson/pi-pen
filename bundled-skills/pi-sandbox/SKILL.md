@@ -18,6 +18,47 @@ For multi-worker or multi-stage work, also read
 [references/orchestration.md](references/orchestration.md). When constructing
 worker assignments, read [references/prompting.md](references/prompting.md).
 
+## Namespace setup (do this first)
+
+Workers only have provider credentials if the persistent home they mount holds
+them. Homes are selected by namespace, and the default `worktree` namespace
+gives every linked worktree its own empty home, so a batch that spans worktrees
+must use one explicit namespace. Check before anything else:
+
+```text
+pi-sandbox namespace show
+```
+
+If it reports `worktree default` or `no pi credentials`:
+
+1. Declare the namespace in the repository manifest so every `run`, `exec`, and
+   `rpc` in any linked worktree inherits it without a flag. Add to `.pi-env.toml`
+   and commit it with the repository:
+
+   ```toml
+   [run]
+   namespace = "<repo>_agents"
+   ```
+
+2. Ask the human to authenticate that namespace once, interactively:
+
+   ```text
+   pi-sandbox run
+   ```
+
+   Provider login (OAuth or API key entry) is the one step that needs a
+   terminal; do not attempt it from a worker or by copying auth files between
+   homes. If the human prefers an API key, a private env file passed with
+   `--env-file` works instead and needs no interactive run.
+
+3. Confirm with `pi-sandbox namespace show` that the home now reports
+   `pi credentials present` and lists the worktrees you intend to use.
+
+Every headless launch prints the resolved home and its credential state to
+stderr, and `run.json` records `namespace`, `worktree_id`, and
+`persistent_home`. When a worker fails at startup, read that line before
+changing anything else.
+
 ## Implementation ownership
 
 Give each implementation agent end-to-end ownership of its change in one
@@ -46,7 +87,26 @@ Overlapping implementations should have one clear owner unless their boundaries
 and integration plan are explicit.
 
 For nontrivial workflows, write a task-specific Python controller outside the
-worker worktrees. Reuse or adapt [assets/orchestrator.py](assets/orchestrator.py)
-for the fragile subprocess, stream, signal, and result-handling mechanics. Keep
-task decomposition, prompts, review sequencing, and integration decisions in
-the task-specific controller rather than forcing them into a generic scheduler.
+worker worktrees. Copy [assets/orchestrator.py](assets/orchestrator.py) next to
+the controller and import it from there; it handles the fragile subprocess,
+stream, signal, and result-handling mechanics. Keep task decomposition, prompts,
+review sequencing, and integration decisions in the task-specific controller
+rather than forcing them into a generic scheduler.
+
+## Harness permissions
+
+Orchestration is only unattended if the host agent can launch workers without a
+prompt for each one. Before a batch, make sure the harness allows the commands
+the controller will run, and say so explicitly if it cannot:
+
+- Claude Code: allow `Bash(pi-sandbox:*)`, `Bash(git worktree:*)`, and
+  `Bash(python3:*)` for the controller, or run the batch in a session where the
+  user has pre-approved them.
+- Codex: the default sandbox cannot reach the Docker socket and cannot write
+  outside the workspace, so every launch and every file under `/tmp` escalates.
+  Run orchestration in a session whose sandbox and approval policy permit
+  Docker and the controller directory, or expect one approval per worker.
+
+Keep the number of distinct commands small: one controller script, one batch
+directory, and `--new-run-under` for retries, rather than a fresh script and
+path per attempt.

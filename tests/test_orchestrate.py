@@ -21,7 +21,9 @@ FAKE = '''#!/usr/bin/env python3
 import json, pathlib, signal, sys, time
 args = sys.argv
 out = pathlib.Path(args[args.index('--output-dir') + 1])
-out.mkdir()
+# Like the real launcher: a nonexistent or existing-but-empty directory is fresh.
+out.mkdir(exist_ok=True)
+assert not any(out.iterdir())
 (out / 'args.json').write_text(json.dumps(args))
 if args[1] == 'rpc':
     command = json.loads(input())
@@ -161,9 +163,18 @@ class ExamplesTest(unittest.TestCase):
         self.assertEqual(args[args.index('--env-file') + 1], str(env_file))
         self.assertEqual(args[args.index('--env') + 1], 'APP_ENV=test')
         self.assertEqual(args[args.index('--namespace') + 1], 'shared_home')
-        self.assertGreater((self.root / 'skill-run/skill-worker.stdout.jsonl').stat().st_size,
+        self.assertEqual(outcome.output_dir, self.root / 'skill-run/skill-worker-01')
+        self.assertGreater((self.root / 'skill-run/skill-worker-01.stdout.jsonl').stat().st_size,
                            1000000)
-        self.assertTrue((self.root / 'skill-run/skill-worker.launcher.log').is_file())
+        self.assertTrue((self.root / 'skill-run/skill-worker-01.launcher.log').is_file())
+
+        retry = SKILL_RUNNER.run_worker(
+            SKILL_RUNNER.Worker('skill-worker', self.worktrees[0], 'again'),
+            output_root=self.root / 'skill-run', binary=str(self.binary), timeout=10)
+        self.assertTrue(retry.completed)
+        self.assertEqual(retry.output_dir, self.root / 'skill-run/skill-worker-02')
+        self.assertTrue((self.root / 'skill-run/skill-worker-02.prompt.txt').is_file())
+        self.assertTrue((self.root / 'skill-run/skill-worker-01/args.json').is_file())
 
 
 if __name__ == '__main__':

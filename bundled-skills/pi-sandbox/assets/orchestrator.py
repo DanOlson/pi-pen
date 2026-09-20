@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
-"""Reusable pi-sandbox worker runner for a task-specific orchestration script."""
+"""Reusable pi-sandbox worker runner for a task-specific orchestration script.
+
+Copy this file next to your controller and import it from there. If you import
+it from the installed skill directory instead, set ``sys.dont_write_bytecode``
+before the import so no ``__pycache__`` is written into the checkout.
+"""
 
 from __future__ import annotations
 
@@ -83,6 +88,23 @@ def _wait_for_worker(process: subprocess.Popen, binary: str, run_dir: Path) -> i
             return process.wait()
 
 
+def _allocate_run_dir(output_root: Path, name: str) -> Path:
+    """Reserve ``<output_root>/<name>-NN`` for the lowest free NN.
+
+    Creating the directory is the reservation, so a retry of the same worker
+    gets ``name-02`` without the controller editing any path. The launcher
+    accepts an existing empty directory as a fresh output directory.
+    """
+    for index in range(1, 10000):
+        candidate = output_root / f"{name}-{index:02d}"
+        try:
+            candidate.mkdir(mode=0o700)
+        except FileExistsError:
+            continue
+        return candidate
+    raise RuntimeError(f"no free run directory for {name} under {output_root}")
+
+
 def run_worker(
     worker: Worker,
     *,
@@ -95,7 +117,7 @@ def run_worker(
     timeout: int = 1800,
     pi_args: Sequence[str] = (),
 ) -> Outcome:
-    """Run one worker. Every call requires a unique name and fresh output root."""
+    """Run one worker; each call allocates ``<output_root>/<name>-NN`` so retries never collide."""
     if not re.fullmatch(r"[A-Za-z0-9_-]+", worker.name):
         raise ValueError("worker names may contain only letters, digits, _ and -")
     if not worker.prompt.strip():
@@ -117,11 +139,12 @@ def run_worker(
     if resolved_binary is None:
         raise FileNotFoundError(f"pi-sandbox executable not found: {binary}")
     binary = str(Path(resolved_binary).resolve(strict=True))
-    run_dir = output_root / worker.name
-    prompt_path = output_root / f"{worker.name}.prompt.txt"
-    stdout_path = output_root / f"{worker.name}.stdout.jsonl"
-    launcher_log = output_root / f"{worker.name}.launcher.log"
-    for path in (run_dir, prompt_path, stdout_path, launcher_log):
+    run_dir = _allocate_run_dir(output_root, worker.name)
+    attempt = run_dir.name
+    prompt_path = output_root / f"{attempt}.prompt.txt"
+    stdout_path = output_root / f"{attempt}.stdout.jsonl"
+    launcher_log = output_root / f"{attempt}.launcher.log"
+    for path in (prompt_path, stdout_path, launcher_log):
         if path.exists():
             raise FileExistsError(f"refusing to reuse worker artifact: {path}")
     prompt_path.write_text(worker.prompt, encoding="utf-8")
