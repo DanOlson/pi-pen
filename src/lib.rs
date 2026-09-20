@@ -144,6 +144,7 @@ pub struct InitOptions {
     pub presets: Vec<String>,
     pub packages: Vec<String>,
     pub commands: Vec<String>,
+    pub namespace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -524,7 +525,25 @@ pub fn init_manifest_from_options(cwd: &Path, options: &InitOptions) -> Result<E
     extend_unique(&mut manifest.packages, options.packages.clone());
     extend_unique(&mut manifest.commands, options.commands.clone());
     manifest.git = git_config_from_options(options);
+    set_manifest_namespace(&mut manifest, options.namespace.as_deref())?;
     Ok(manifest)
+}
+
+/// Declare a shared persistent-home namespace in `[run]`; `worktree` or blank keeps
+/// the default per-worktree homes and writes nothing.
+fn set_manifest_namespace(manifest: &mut EnvManifest, namespace: Option<&str>) -> Result<()> {
+    let Some(namespace) = namespace.map(str::trim).filter(|n| !n.is_empty()) else {
+        return Ok(());
+    };
+    if namespace == "worktree" {
+        return Ok(());
+    }
+    launch::validate_namespace(namespace)?;
+    manifest
+        .run
+        .get_or_insert_with(RunConfig::default)
+        .namespace = Some(namespace.to_string());
+    Ok(())
 }
 
 pub fn write_project_manifest(cwd: &Path, manifest: &EnvManifest, force: bool) -> Result<PathBuf> {
@@ -589,6 +608,14 @@ fn prompt_for_manifest(cwd: &Path, options: &InitOptions) -> Result<EnvManifest>
     extend_unique(&mut manifest.commands, options.commands.clone());
     extend_unique(&mut manifest.commands, prompt_repeated("Setup command")?);
     manifest.git = git_config_from_options(options);
+    let namespace = match &options.namespace {
+        Some(namespace) => namespace.clone(),
+        None => prompt_default(
+            "Persistent home namespace shared by linked worktrees (`worktree` keeps one home per worktree)",
+            "worktree",
+        )?,
+    };
+    set_manifest_namespace(&mut manifest, Some(&namespace))?;
 
     Ok(manifest)
 }
@@ -1764,6 +1791,7 @@ mod tests {
             presets: Vec::new(),
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
@@ -1809,6 +1837,7 @@ mod tests {
             presets: vec!["python".to_string()],
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
@@ -1837,6 +1866,7 @@ mod tests {
             presets: vec!["rust".to_string()],
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
@@ -1880,6 +1910,7 @@ mod tests {
             presets: vec!["tauri".to_string()],
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
@@ -1909,6 +1940,7 @@ mod tests {
             presets: vec!["rails".to_string()],
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
@@ -1945,6 +1977,7 @@ mod tests {
             presets: vec!["rails".to_string()],
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let err = init_manifest_from_options(dir.path(), &options).unwrap_err();
@@ -1970,6 +2003,7 @@ mod tests {
             presets: vec!["rails".to_string()],
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let err = init_manifest_from_options(dir.path(), &options).unwrap_err();
@@ -1978,6 +2012,39 @@ mod tests {
             err.to_string()
                 .contains("cannot be combined with `--base-image`")
         );
+    }
+
+    #[test]
+    fn init_namespace_writes_run_section_and_validates() {
+        let dir = tempdir().unwrap();
+        let options = |namespace: &str| InitOptions {
+            yes: true,
+            force: false,
+            name: Some("app".to_string()),
+            base_image: None,
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(true),
+            presets: vec!["rust".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+            namespace: Some(namespace.to_string()),
+        };
+
+        let shared = init_manifest_from_options(dir.path(), &options("app_agents")).unwrap();
+        let run = shared.run.as_ref().unwrap();
+        assert_eq!(run.namespace.as_deref(), Some("app_agents"));
+        assert!(
+            run.env.contains_key("CARGO_TARGET_DIR"),
+            "presets must survive"
+        );
+
+        let default = init_manifest_from_options(dir.path(), &options("worktree")).unwrap();
+        assert!(default.run.as_ref().unwrap().namespace.is_none());
+
+        let err = init_manifest_from_options(dir.path(), &options("Bad-Name")).unwrap_err();
+        assert!(err.to_string().contains("invalid namespace"));
     }
 
     #[test]
@@ -1995,6 +2062,7 @@ mod tests {
             presets: vec!["unknown".to_string()],
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let err = init_manifest_from_options(dir.path(), &options).unwrap_err();
@@ -2017,6 +2085,7 @@ mod tests {
             presets: Vec::new(),
             packages: Vec::new(),
             commands: Vec::new(),
+            namespace: None,
         };
 
         let manifest = init_manifest_from_options(dir.path(), &options).unwrap();

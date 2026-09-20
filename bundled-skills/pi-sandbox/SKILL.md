@@ -32,8 +32,9 @@ pi-sandbox namespace show
 If it reports `worktree default` or `no pi credentials`:
 
 1. Declare the namespace in the repository manifest so every `run`, `exec`, and
-   `rpc` in any linked worktree inherits it without a flag. Add to `.pi-env.toml`
-   and commit it with the repository:
+   `rpc` in any linked worktree inherits it without a flag. For a new manifest,
+   `pi-sandbox init --namespace <repo>_agents` writes it; for an existing one,
+   add this to `.pi-env.toml`. Commit it with the repository either way:
 
    ```toml
    [run]

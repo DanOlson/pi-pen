@@ -388,7 +388,7 @@ fn source_dir(source: &EnvSource, cwd: &Path) -> PathBuf {
     }
 }
 
-fn validate_namespace(value: &str) -> Result<&str> {
+pub(crate) fn validate_namespace(value: &str) -> Result<&str> {
     let valid = value.len() <= 40
         && value.as_bytes().first().is_some_and(u8::is_ascii_lowercase)
         && value

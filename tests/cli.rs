@@ -543,6 +543,23 @@ fn init_with_rails_writes_pinned_ruby_node_manifest() {
 }
 
 #[test]
+fn init_namespace_flag_writes_run_namespace() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args(["init", "--yes", "--namespace", "app_agents"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
+    assert!(
+        manifest.contains("[run]\nnamespace = \"app_agents\""),
+        "{manifest}"
+    );
+}
+
+#[test]
 fn init_with_unknown_preset_fails() {
     let dir = tempdir().unwrap();
     let output = Command::new(bin())

@@ -94,7 +94,9 @@ pi-sandbox init
 ```
 
 The wizard prompts for an environment name, base image, default package choice,
-additional apt packages, and setup commands. It writes `.pi-env.toml` and will
+additional apt packages, setup commands, and a persistent home namespace
+(`worktree`, the default, keeps one home per worktree; any other name is
+written to `[run] namespace` so linked worktrees share credentials). It writes `.pi-env.toml` and will
 not overwrite an existing manifest unless `--force` is passed.
 
 Use defaults without prompting:
@@ -112,6 +114,7 @@ pi-sandbox init --yes --with rust,node
 pi-sandbox init --yes --with rails
 pi-sandbox init --yes --with tauri
 pi-sandbox init --yes --git-user-name "Your Name" --git-user-email you@example.com
+pi-sandbox init --yes --namespace myapp_agents
 pi-sandbox init --yes --no-default-packages --package ripgrep
 pi-sandbox init --force
 ```

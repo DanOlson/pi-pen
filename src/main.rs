@@ -269,6 +269,9 @@ struct InitArgs {
     /// Setup command to add to the Dockerfile. Can be repeated.
     #[arg(long = "command")]
     commands: Vec<String>,
+    /// Persistent home namespace shared by linked worktrees, written to `[run]`.
+    #[arg(long)]
+    namespace: Option<String>,
 }
 
 impl From<Cli> for pi_sandbox::Cli {
@@ -298,6 +301,7 @@ impl From<Cli> for pi_sandbox::Cli {
                     presets: args.presets,
                     packages: args.packages,
                     commands: args.commands,
+                    namespace: args.namespace,
                 }),
                 Command::Run(args) => pi_sandbox::Command::Run {
                     env: args.env,
