@@ -535,3 +535,83 @@ fn dry_run_and_namespace_show_report_the_same_home() {
     assert!(home_line.contains(home));
     assert!(!fixture.root.path().join("config/homes").exists());
 }
+
+#[test]
+fn namespace_adopt_copies_credentials_into_the_resolved_home() {
+    let fixture = Fixture::new();
+    let legacy = fixture.root.path().join("legacy-home");
+    fs::create_dir_all(legacy.join(".pi/agent")).unwrap();
+    fs::write(legacy.join(".pi/agent/auth.json"), b"{\"openai\":{}}").unwrap();
+    fs::write(legacy.join(".pi/agent/settings.json"), b"{}").unwrap();
+
+    let mut adopt = fixture.base_command("success");
+    adopt
+        .args([
+            "namespace",
+            "adopt",
+            "--namespace",
+            "batch_shared",
+            "--from",
+        ])
+        .arg(&legacy);
+    let output = bounded_output(adopt);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(".pi/agent/auth.json, .pi/agent/settings.json"),
+        "{stdout}"
+    );
+    assert!(
+        legacy.join(".pi/agent/auth.json").is_file(),
+        "source must be left in place"
+    );
+
+    let mut show = fixture.base_command("success");
+    show.args(["namespace", "show", "--namespace", "batch_shared", "--json"]);
+    let report: Value = serde_json::from_slice(&bounded_output(show).stdout).unwrap();
+    assert_eq!(report["pi_credentials"], true);
+    let home = PathBuf::from(report["persistent_home"].as_str().unwrap());
+    assert_eq!(
+        fs::read(home.join(".pi/agent/auth.json")).unwrap(),
+        b"{\"openai\":{}}"
+    );
+    assert_eq!(
+        fs::metadata(home.join(".pi/agent/auth.json"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o600
+    );
+
+    let mut again = fixture.base_command("success");
+    again
+        .args([
+            "namespace",
+            "adopt",
+            "--namespace",
+            "batch_shared",
+            "--from",
+        ])
+        .arg(&legacy);
+    let refused = bounded_output(again);
+    assert!(!refused.status.success());
+    assert!(String::from_utf8_lossy(&refused.stderr).contains("pass --force"));
+
+    let mut forced = fixture.base_command("success");
+    forced
+        .args([
+            "namespace",
+            "adopt",
+            "--namespace",
+            "batch_shared",
+            "--force",
+            "--from",
+        ])
+        .arg(&legacy);
+    assert!(bounded_output(forced).status.success());
+}

@@ -118,6 +118,12 @@ pub enum NamespaceCommand {
     List {
         json: bool,
     },
+    Adopt {
+        env: Option<String>,
+        namespace: Option<String>,
+        from: PathBuf,
+        force: bool,
+    },
 }
 
 #[derive(Debug)]
@@ -311,6 +317,12 @@ pub fn run_cli(cli: Cli) -> Result<()> {
                 json,
             } => namespace_show(&cli.cwd, env.as_deref(), namespace, json)?,
             NamespaceCommand::List { json } => namespace_list(json)?,
+            NamespaceCommand::Adopt {
+                env,
+                namespace,
+                from,
+                force,
+            } => namespace_adopt(&cli.cwd, env.as_deref(), namespace, &from, force)?,
         },
     }
 
@@ -412,6 +424,87 @@ fn linked_worktrees(cwd: &Path) -> Result<Vec<PathBuf>> {
         .filter_map(|line| line.strip_prefix("worktree "))
         .map(PathBuf::from)
         .collect())
+}
+
+/// Pi state worth carrying between homes: credentials plus the settings that
+/// select providers and models. Caches and installed packages are left behind.
+const ADOPTABLE_PI_FILES: &[&str] = &[
+    PI_AUTH_FILE,
+    ".pi/agent/settings.json",
+    ".pi/agent/models-store.json",
+];
+
+fn namespace_adopt(
+    cwd: &Path,
+    env: Option<&str>,
+    namespace: Option<String>,
+    from: &Path,
+    force: bool,
+) -> Result<()> {
+    let source = if from.is_absolute() {
+        from.to_path_buf()
+    } else {
+        cwd.join(from)
+    };
+    let source = fs::canonicalize(&source)
+        .with_context(|| format!("source home does not exist: {}", source.display()))?;
+    if !source.join(PI_AUTH_FILE).is_file() {
+        bail!(
+            "{} holds no pi credentials ({PI_AUTH_FILE} is missing)",
+            source.display()
+        );
+    }
+    let resolved = resolve_env(env, cwd)?;
+    let overrides = RunOverrides {
+        namespace,
+        ..RunOverrides::default()
+    };
+    let launch = launch::resolve_run_config(&resolved, cwd, &overrides)?;
+    let base = homes_dir()?;
+    let identity = resolve_home_identity(&base, cwd, &resolved, &launch);
+    let destination = ensure_home(&base, cwd, &resolved, &identity)?;
+    let destination_canonical =
+        fs::canonicalize(&destination).unwrap_or_else(|_| destination.clone());
+    if destination_canonical == source {
+        bail!(
+            "{} is already the home for namespace {}",
+            source.display(),
+            identity.namespace
+        );
+    }
+    if home_has_pi_credentials(&destination) && !force {
+        bail!(
+            "{} already holds pi credentials; pass --force to replace them",
+            destination.display()
+        );
+    }
+    let mut copied = Vec::new();
+    for relative in ADOPTABLE_PI_FILES {
+        let from_file = source.join(relative);
+        if !from_file.is_file() {
+            continue;
+        }
+        let to_file = destination.join(relative);
+        if let Some(parent) = to_file.parent() {
+            fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create {}", parent.display()))?;
+        }
+        fs::copy(&from_file, &to_file).with_context(|| format!("failed to copy {relative}"))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&to_file, fs::Permissions::from_mode(0o600))?;
+        }
+        copied.push(*relative);
+    }
+    println!(
+        "adopted {} into {} (namespace {})",
+        copied.join(", "),
+        destination.display(),
+        identity.namespace
+    );
+    println!("source left untouched: {}", source.display());
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]

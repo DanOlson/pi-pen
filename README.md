@@ -48,6 +48,7 @@ pi-sandbox env list
 pi-sandbox env show [ENV]
 pi-sandbox namespace show [ENV] [--namespace NAME] [--json]
 pi-sandbox namespace list [--json]
+pi-sandbox namespace adopt [ENV] [--namespace NAME] --from HOME_DIR [--force]
 pi-sandbox skills install [--project-dir PATH] [--link-claude | --no-link-claude] [--force]
 ```
 
@@ -375,7 +376,14 @@ Inspect what a worktree resolves to without touching Docker:
 pi-sandbox namespace show                # this worktree's home, credentials, sharing worktrees
 pi-sandbox namespace show --namespace x  # what an explicit namespace would resolve to
 pi-sandbox namespace list                # every persistent home on this machine
+pi-sandbox namespace adopt --from DIR    # copy pi credentials from an older home
 ```
+
+`adopt` copies `.pi/agent/auth.json`, `settings.json`, and `models-store.json`
+from any existing home into the one the current worktree, environment, and
+namespace resolve to. It never deletes or modifies the source and refuses to
+overwrite existing credentials without `--force`. Use it after a manifest
+rename or namespace change left a login behind in a `legacy` home.
 
 A home is keyed on the repository's Git common directory, the manifest `name`,
 and the namespace; it survives moving or renaming the manifest file. Each home

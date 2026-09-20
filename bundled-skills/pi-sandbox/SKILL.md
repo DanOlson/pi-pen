@@ -48,9 +48,12 @@ If it reports `worktree default` or `no pi credentials`:
    ```
 
    Provider login (OAuth or API key entry) is the one step that needs a
-   terminal; do not attempt it from a worker or by copying auth files between
-   homes. If the human prefers an API key, a private env file passed with
-   `--env-file` works instead and needs no interactive run.
+   terminal; do not attempt it from a worker or by copying auth files by hand.
+   If `pi-sandbox namespace list` shows another home for this repository that
+   already holds credentials, `pi-sandbox namespace adopt --from <that-home>`
+   copies them into the resolved home without an interactive run. If the human
+   prefers an API key, a private env file passed with `--env-file` works
+   instead.
 
 3. Confirm with `pi-sandbox namespace show` that the home now reports
    `pi credentials present` and lists the worktrees you intend to use.

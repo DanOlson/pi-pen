@@ -64,6 +64,23 @@ enum NamespaceCommand {
         #[arg(long)]
         json: bool,
     },
+    /// Copy pi credentials and settings from another home into the resolved one.
+    Adopt(NamespaceAdoptArgs),
+}
+
+#[derive(Debug, Args)]
+struct NamespaceAdoptArgs {
+    /// Environment name or manifest path.
+    env: Option<String>,
+    /// Namespace to resolve instead of the manifest or worktree default.
+    #[arg(long)]
+    namespace: Option<String>,
+    /// Existing persistent home directory to copy from (see `namespace list`).
+    #[arg(long)]
+    from: PathBuf,
+    /// Replace credentials the destination already holds.
+    #[arg(long)]
+    force: bool,
 }
 
 #[derive(Debug, Args)]
@@ -356,6 +373,12 @@ impl From<Cli> for pi_sandbox::Cli {
                         NamespaceCommand::List { json } => {
                             pi_sandbox::NamespaceCommand::List { json }
                         }
+                        NamespaceCommand::Adopt(args) => pi_sandbox::NamespaceCommand::Adopt {
+                            env: args.env,
+                            namespace: args.namespace,
+                            from: args.from,
+                            force: args.force,
+                        },
                     },
                 },
                 Command::Skills { command } => pi_sandbox::Command::Skills {
