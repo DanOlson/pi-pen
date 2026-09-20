@@ -52,6 +52,17 @@ const RUSTUP_COMMAND: &str = "curl --proto '=https' --tlsv1.2 -sSf https://sh.ru
 const RUST_COMPONENTS_COMMAND: &str = "CARGO_HOME=/opt/cargo RUSTUP_HOME=/opt/rustup /opt/cargo/bin/rustup component add rustfmt clippy";
 const RUST_PERMISSIONS_COMMAND: &str = "chmod -R a+rX /opt/cargo /opt/rustup";
 const UV_VERSION: &str = "0.12.0";
+const RAILS_RUBY_IMAGE: &str = "ruby:4.0.1-bookworm";
+const RAILS_BASE_STAGE: &str = "rails-ruby-node";
+const RAILS_NODE_STAGE: &str = "pi-node-runtime";
+const RAILS_BUNDLE_PATH: &str = "/tmp/pi-home/bundle";
+const RAILS_PACKAGES: &[&str] = &[
+    "libpq-dev",
+    "postgresql-client",
+    "libvips",
+    "sqlite3",
+    "libsqlite3-dev",
+];
 const TAURI_PACKAGES: &[&str] = &[
     "file",
     "libssl-dev",
@@ -292,6 +303,7 @@ pub fn init_manifest_interactive(cwd: &Path, options: InitOptions) -> Result<Pat
 }
 
 pub fn init_manifest_from_options(cwd: &Path, options: &InitOptions) -> Result<EnvManifest> {
+    validate_preset_options(options)?;
     let mut manifest = EnvManifest {
         name: Some(
             options
@@ -360,6 +372,9 @@ fn prompt_for_manifest(cwd: &Path, options: &InitOptions) -> Result<EnvManifest>
     };
     let mut presets = options.presets.clone();
     presets.extend(prompt_list("Stack presets")?);
+    if preset_selected(&presets, "rails") && options.base_image.is_some() {
+        bail!("the rails preset cannot be combined with `--base-image`");
+    }
 
     let mut manifest = EnvManifest {
         name: Some(name),
@@ -392,6 +407,19 @@ fn git_config_from_options(options: &InitOptions) -> Option<GitConfig> {
             user_email: options.git_user_email.clone(),
         })
     }
+}
+
+fn validate_preset_options(options: &InitOptions) -> Result<()> {
+    if preset_selected(&options.presets, "rails") && options.base_image.is_some() {
+        bail!("the rails preset cannot be combined with `--base-image`");
+    }
+    Ok(())
+}
+
+fn preset_selected(presets: &[String], expected: &str) -> bool {
+    expand_presets(presets)
+        .iter()
+        .any(|preset| preset == expected)
 }
 
 fn apply_presets(manifest: &mut EnvManifest, presets: &[String]) -> Result<()> {
@@ -439,16 +467,60 @@ fn apply_presets(manifest: &mut EnvManifest, presets: &[String]) -> Result<()> {
                     .runtime_env
                     .insert("PATH".to_string(), RUST_PATH.to_string());
             }
+            "rails" => {
+                if manifest.extends.is_some() {
+                    bail!("the rails preset cannot be combined with `extends`");
+                }
+                if manifest.base_image.as_deref().is_some_and(|base_image| {
+                    base_image != DEFAULT_BASE_IMAGE && base_image != RAILS_BASE_STAGE
+                }) {
+                    bail!(
+                        "the rails preset selects `{RAILS_RUBY_IMAGE}` and cannot be combined with a custom base image"
+                    );
+                }
+                manifest.base_image = Some(RAILS_BASE_STAGE.to_string());
+                extend_unique(
+                    &mut manifest.packages,
+                    RAILS_PACKAGES.iter().map(|package| package.to_string()),
+                );
+                manifest
+                    .runtime_env
+                    .insert("BUNDLE_PATH".to_string(), RAILS_BUNDLE_PATH.to_string());
+                manifest
+                    .runtime_env
+                    .insert("BUNDLE_JOBS".to_string(), "4".to_string());
+                manifest
+                    .runtime_env
+                    .insert("BUNDLE_RETRY".to_string(), "3".to_string());
+                manifest.dockerfile = Some(DockerfileHooks {
+                    prepend: Some(rails_dockerfile_prelude()),
+                    append: None,
+                });
+            }
             "tauri" => {
                 extend_unique(
                     &mut manifest.packages,
                     TAURI_PACKAGES.iter().map(|package| package.to_string()),
                 );
             }
-            _ => bail!("unknown preset `{preset}`; expected one of: node, python, rust, tauri"),
+            _ => bail!(
+                "unknown preset `{preset}`; expected one of: node, python, rails, rust, tauri"
+            ),
         }
     }
     Ok(())
+}
+
+fn rails_dockerfile_prelude() -> String {
+    format!(
+        "# syntax=docker/dockerfile:1\n\
+FROM {DEFAULT_BASE_IMAGE} AS {RAILS_NODE_STAGE}\n\
+FROM {RAILS_RUBY_IMAGE} AS {RAILS_BASE_STAGE}\n\
+COPY --from={RAILS_NODE_STAGE} /usr/local/bin/node /usr/local/bin/node\n\
+COPY --from={RAILS_NODE_STAGE} /usr/local/lib/node_modules /usr/local/lib/node_modules\n\
+COPY --from={RAILS_NODE_STAGE} /usr/local/include/node /usr/local/include/node\n\
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm && ln -s ../lib/node_modules/npm/bin/npx-cli.js /usr/local/bin/npx && ln -s ../lib/node_modules/corepack/dist/corepack.js /usr/local/bin/corepack && corepack enable"
+    )
 }
 
 fn uv_install_command() -> String {
@@ -1479,6 +1551,92 @@ mod tests {
             manifest
                 .packages
                 .contains(&"libwebkit2gtk-4.1-dev".to_string())
+        );
+    }
+
+    #[test]
+    fn rails_preset_uses_pinned_ruby_with_node_and_persistent_bundle_path() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: Some("rails-app".to_string()),
+            base_image: None,
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(true),
+            presets: vec!["rails".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let manifest = init_manifest_from_options(dir.path(), &options).unwrap();
+        let dockerfile = render_dockerfile(&manifest);
+
+        assert_eq!(manifest.base_image.as_deref(), Some(RAILS_BASE_STAGE));
+        assert!(manifest.packages.contains(&"libpq-dev".to_string()));
+        assert!(manifest.packages.contains(&"libvips".to_string()));
+        assert_eq!(
+            manifest.runtime_env.get("BUNDLE_PATH").map(String::as_str),
+            Some(RAILS_BUNDLE_PATH)
+        );
+        assert!(dockerfile.contains(&format!("FROM {DEFAULT_BASE_IMAGE} AS {RAILS_NODE_STAGE}")));
+        assert!(dockerfile.contains(&format!("FROM {RAILS_RUBY_IMAGE} AS {RAILS_BASE_STAGE}")));
+        assert!(dockerfile.contains(&format!("FROM {RAILS_BASE_STAGE}")));
+        assert!(dockerfile.contains("COPY --from=pi-node-runtime /usr/local/bin/node"));
+        assert!(dockerfile.contains("ln -s ../lib/node_modules/npm/bin/npm-cli.js"));
+        assert!(dockerfile.contains("corepack enable"));
+        assert!(dockerfile.contains(DEFAULT_PI_INSTALL));
+    }
+
+    #[test]
+    fn rails_preset_rejects_environment_inheritance() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: Some("rails-app".to_string()),
+            base_image: None,
+            extends: Some("shared".to_string()),
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(true),
+            presets: vec!["rails".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let err = init_manifest_from_options(dir.path(), &options).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with `extends`")
+        );
+    }
+
+    #[test]
+    fn rails_preset_rejects_a_custom_base_image() {
+        let dir = tempdir().unwrap();
+        let options = InitOptions {
+            yes: true,
+            force: false,
+            name: Some("rails-app".to_string()),
+            base_image: Some("debian:bookworm".to_string()),
+            extends: None,
+            git_user_name: None,
+            git_user_email: None,
+            default_packages: Some(true),
+            presets: vec!["rails".to_string()],
+            packages: Vec::new(),
+            commands: Vec::new(),
+        };
+
+        let err = init_manifest_from_options(dir.path(), &options).unwrap_err();
+
+        assert!(
+            err.to_string()
+                .contains("cannot be combined with `--base-image`")
         );
     }
 

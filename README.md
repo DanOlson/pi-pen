@@ -107,6 +107,7 @@ Common overrides:
 pi-sandbox init --yes --name my-env --base-image node:22-bookworm
 pi-sandbox init --yes --extends rust-node
 pi-sandbox init --yes --with rust,node
+pi-sandbox init --yes --with rails
 pi-sandbox init --yes --with tauri
 pi-sandbox init --yes --git-user-name "Your Name" --git-user-email you@example.com
 pi-sandbox init --yes --no-default-packages --package ripgrep
@@ -117,10 +118,17 @@ Stack presets expand into plain manifest content:
 
 - `node`: use the default Node LTS base image.
 - `python`: add Python runtime packages and install pinned uv/uvx binaries.
+- `rails`: use Ruby 4.0.1 on Bookworm, copy Node 22 from the official Node
+  image for `pi` and asset tooling, add PostgreSQL, SQLite, and libvips
+  dependencies, and persist installed bundle gems in the project home.
 - `rust`: install Rust under `/opt/cargo` and `/opt/rustup`, add `rustfmt`
   and `clippy`, and set runtime Cargo/Rust environment.
 - `tauri`: includes `node` and `rust`, then adds common Tauri v2 Linux build
   dependencies.
+
+The `rails` preset selects its pinned Ruby base and therefore cannot be combined
+with `--base-image` or `--extends`. Add project-specific system dependencies
+with repeated `--package` options or by editing the generated manifest.
 
 The Python preset installs uv 0.12.0 into `/usr/local/bin` as an unmanaged
 installation. Pinning the version keeps the generated environment reproducible;

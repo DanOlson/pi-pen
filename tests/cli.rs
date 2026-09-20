@@ -521,6 +521,26 @@ fn init_with_tauri_writes_preset_manifest() {
 }
 
 #[test]
+fn init_with_rails_writes_pinned_ruby_node_manifest() {
+    let dir = tempdir().unwrap();
+    let output = Command::new(bin())
+        .args(["init", "--yes", "--with", "rails"])
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success());
+    let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
+    assert!(manifest.contains("base_image = \"rails-ruby-node\""));
+    assert!(manifest.contains("ruby:4.0.1-bookworm"));
+    assert!(manifest.contains("node:22-bookworm"));
+    assert!(manifest.contains("libpq-dev"));
+    assert!(manifest.contains("libvips"));
+    assert!(manifest.contains("BUNDLE_PATH = \"/tmp/pi-home/bundle\""));
+    assert!(manifest.contains("[dockerfile]"));
+}
+
+#[test]
 fn init_with_unknown_preset_fails() {
     let dir = tempdir().unwrap();
     let output = Command::new(bin())
