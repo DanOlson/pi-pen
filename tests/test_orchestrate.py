@@ -227,6 +227,23 @@ class ExamplesTest(unittest.TestCase):
         self.assertIn('provider_capacity: Selected model is at capacity', resumed_prompt)
         self.assertIn('git status', resumed_prompt)
         self.assertTrue(any('resume in 0s' in line for line in logs), logs)
+        self.assertTrue(any('swapping to backup' in line for line in logs), logs)
+
+    def test_run_with_recovery_alternates_between_model_pair(self):
+        # Capacity on the primary swaps to the fallback; capacity on the
+        # fallback swaps back, rather than staying on the weaker model.
+        attempts, logs = self.recover(
+            'ping-pong', 'capacity', max_attempts=4,
+            recovery_prompt='capacity again: {error_class}{advice}',
+            pi_args=['--provider', 'openai-codex', '--model', 'gpt-5.6-sol'],
+            fallback_pi_args=['--provider', 'openai-codex', '--model', 'gpt-5.5'])
+        models = []
+        for outcome in attempts:
+            args = json.loads((outcome.output_dir / 'args.json').read_text())
+            models.append(args[args.index('--model') + 1])
+        self.assertEqual(models, ['gpt-5.6-sol', 'gpt-5.5', 'gpt-5.6-sol', 'gpt-5.5'])
+        self.assertIn('swapping to openai-codex/gpt-5.5', logs[0])
+        self.assertIn('swapping to openai-codex/gpt-5.6-sol', logs[2])
 
     def test_run_with_recovery_adjusts_once_for_timeouts(self):
         attempts, _ = self.recover('slowpoke', 'timeout', timeout_growth=3)

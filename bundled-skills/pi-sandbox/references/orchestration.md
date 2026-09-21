@@ -200,7 +200,7 @@ recurs after it. Never make a second attempt of the same kind.
 
 | `recovery` | Classes | Autonomous move | Escalate when |
 | --- | --- | --- | --- |
-| `resume` | `provider_capacity`, `rate_limit`, `transport`, `stream_interrupted` | Wait (30s, 2m, 5m), resume the session as it is. After repeated `provider_capacity`, resume with a fallback `--model` if one is agreed. Do not add parallel workers on the same account while rate-limited. | Attempts are exhausted, or the fallback model is also at capacity. |
+| `resume` | `provider_capacity`, `rate_limit`, `transport`, `stream_interrupted` | Wait (30s, 2m, 5m), resume the session as it is. On `provider_capacity`, swap to the other model of the agreed pair (below) for the next attempt. Do not add parallel workers on the same account while rate-limited. | Attempts are exhausted, or both models of the pair are at capacity back to back. |
 | `resume_adjusted` | `timeout` | Look at `status` for the last tool call: if the worker was stuck on one command, name it in the prompt. Resume once with `--timeout` doubled and a prompt that says to finish and commit verified work first. | A second timeout, or the same command hangs both times. |
 | `resume_adjusted` | `worker_exit`, `aborted`, `unknown` | Read `stderr.log` / the message. Resume once; a resume does not replay actions, so the cost of a wasted attempt is low. Note an `unknown` message so the classifier can learn it. | It recurs, or stderr shows out-of-memory or a broken image. |
 | `restart` | `context_overflow` | Start one fresh session from a handoff prompt: the original assignment, `git status`/`git log`/`git diff --stat` from the worktree, and the old session's last report. Tell it to keep its context small. | The fresh session also overflows: the assignment needs splitting, which is a scoping decision. |
@@ -212,6 +212,31 @@ daemon, an assignment too large for one context even when fresh, and any
 failure that recurs after its one adjusted attempt. Everything else has one
 well-defined move. When you do escalate, report the run directory, the
 class, the message, and which moves were already made.
+
+### Choosing a fallback model
+
+Capacity is per model and transient, so treat the primary and fallback as a
+pair to alternate between, not a one-way downgrade: a capacity error on the
+primary moves the next attempt to the fallback, and a capacity error on the
+fallback moves it back. Work does not get stranded on the weaker model by a
+single blip, and the run never waits on a model that has just said no.
+
+Pick the pair so that a swap changes nothing except the model:
+
+- Same provider and the same credentials in the namespace, so the resumed
+  session authenticates the same way and the swap needs no new setup.
+- Same tool support and comparable context window, so the session's tool
+  calls, thinking level, and accumulated context remain valid.
+- The fallback is the nearest sibling that is good enough to *finish* the
+  assignment, not merely to answer; a reviewer still judges the result.
+- Lead with the stronger model. The pair for `openai-codex` workers is
+  `gpt-5.6-sol` primary and `gpt-5.5` fallback.
+
+Say which model each attempt ran on when reporting: `run_with_recovery` logs
+`swapping to PROVIDER/MODEL` at every swap, and each attempt's
+`<name>-NN.launcher.log` and `sessions/` record it. Do not swap providers as
+a fallback; that is a credentials and namespace change, which is a human
+decision.
 
 ### Resuming by hand
 
@@ -234,10 +259,11 @@ omit `--resume-session` and write the handoff prompt described above.
 
 `run_with_recovery` in `assets/orchestrator.py` walks the ladder for you: it
 follows `error.recovery` after every attempt, resumes or restarts in a fresh
-`NAME-NN` directory, applies backoff, doubles the timeout once, builds the
-handoff prompt, checks credentials before giving up on `auth`, bounds the
-total number of runs, and logs one line per decision so the orchestrator
-narrating progress sees why a worker restarted.
+`NAME-NN` directory, applies backoff, alternates the model pair on capacity,
+doubles the timeout once, builds the handoff prompt, checks credentials
+before giving up on `auth`, bounds the total number of runs, and logs one
+line per decision so the orchestrator narrating progress sees why a worker
+restarted.
 
 ```python
 attempts = run_with_recovery(
@@ -248,7 +274,7 @@ attempts = run_with_recovery(
     pi_args=["--provider", "PROVIDER", "--model", "MODEL"],
     max_attempts=4,
     backoff_seconds=(30, 120, 300),
-    fallback_pi_args=["--provider", "PROVIDER", "--model", "FALLBACK_MODEL"],  # optional
+    fallback_pi_args=["--provider", "PROVIDER", "--model", "FALLBACK_MODEL"],  # alternates on capacity
 )
 outcome = attempts[-1]
 if outcome.escalation:

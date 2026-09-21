@@ -421,9 +421,12 @@ def run_with_recovery(
 
     - ``resume`` (capacity, rate limit, transport, interrupted stream): wait
       the next ``backoff_seconds`` entry (the last repeats), then resume the
-      session with ``recovery_prompt``. ``fallback_pi_args`` replaces
-      ``pi_args`` after a ``provider_capacity`` failure, for example to switch
-      model; off by default because that is a judgment call.
+      session with ``recovery_prompt``. After a ``provider_capacity`` failure
+      the next attempt swaps ``pi_args`` and ``fallback_pi_args``, so the
+      worker alternates between the primary and fallback model for as long as
+      capacity errors continue: a fallback that is itself at capacity hands
+      back to the primary. Off by default because a model swap mid-task is a
+      judgment call; see the orchestration reference for choosing the pair.
     - ``resume_adjusted`` (timeout, worker exit, aborted, unknown): resume
       once per class with a changed launch: a timeout multiplied by
       ``timeout_growth``, and class-specific advice in the prompt. A second
@@ -448,6 +451,7 @@ def run_with_recovery(
         raise ValueError("timeout_growth must be at least 1")
     log = log or (lambda text: print(text, file=sys.stderr, flush=True))
     pi_args = list(kwargs.pop("pi_args", ()))
+    alternate_pi_args = list(fallback_pi_args) if fallback_pi_args is not None else None
     timeout = int(kwargs.pop("timeout", 1800))
     attempts: list[Outcome] = []
     adjusted_classes: set[str] = set()
@@ -474,9 +478,9 @@ def run_with_recovery(
         advice = ""
         resume = True
         if recovery == "resume":
-            if fallback_pi_args is not None and error_class == "provider_capacity":
-                pi_args = list(fallback_pi_args)
-                log(f"{worker.name}: switching to fallback pi args for the next attempt")
+            if alternate_pi_args is not None and error_class == "provider_capacity":
+                pi_args, alternate_pi_args = alternate_pi_args, pi_args
+                log(f"{worker.name}: swapping to {_describe_model(pi_args)} for the next attempt")
         elif recovery == "resume_adjusted":
             if error_class in adjusted_classes:
                 stop(outcome, f"{error_class} recurred after an adjusted attempt")
@@ -529,6 +533,15 @@ def run_with_recovery(
         else:
             current = Worker(worker.name, worker.worktree, handoff_prompt(worker, outcome))
     return attempts
+
+
+def _describe_model(pi_args: Sequence[str]) -> str:
+    """``provider/model`` from pi args, for log lines."""
+    args = list(pi_args)
+    def value(flag: str) -> str | None:
+        return args[args.index(flag) + 1] if flag in args[:-1] else None
+    parts = [part for part in (value("--provider"), value("--model")) if part]
+    return "/".join(parts) if parts else "the same pi args"
 
 
 def _interruptible_sleep(seconds: float) -> bool:
