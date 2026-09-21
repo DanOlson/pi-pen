@@ -173,40 +173,49 @@ before launching again.
 
 A worker that stops short does not hang: the launcher exits non-zero and
 writes `result.json` with `status: failed` and a `reason`. When the stop was
-the model's or the transport's doing, `result.json.error` (also on the
-`run_finished` stdout envelope and in the `status` line) says what happened
-without anyone reading `events.jsonl`:
+the model's, the transport's, or the container's doing, `result.json.error`
+(also on the `run_finished` stdout envelope and in the `status` line) says
+what happened and what to do, without anyone reading `events.jsonl`:
 
 ```json
 "reason": "agent_error",
 "error": {
   "class": "provider_capacity",
-  "message": "Selected model is at capacity. Please try a different model.",
+  "recovery": "resume",
   "recoverable": true,
+  "message": "Selected model is at capacity. Please try a different model.",
   "provider": "openai-codex", "model": "MODEL"
 }
 ```
 
-`recoverable` means resuming the recorded session is the expected next step.
-It never means the worktree is untouched: resume restores the conversation,
-not files, so the worker (or you) must check `git status` first.
+`recovery` is the one autonomous move to make next. `recoverable` is its
+shorthand for `resume`. Neither means the worktree is untouched: resume
+restores the conversation, not files, so the worker (or you) must check
+`git status` first.
 
-| `error.class` | Typical message | What to do |
-| --- | --- | --- |
-| `provider_capacity` | "at capacity", "overloaded", 503/529 | Wait 30s-5m, resume the session. After repeated hits, resume with a different `--model`. |
-| `rate_limit` | 429, "rate limit", "quota" | Wait longer than the last backoff, resume. Do not add parallel workers on the same account. |
-| `transport` | "WebSocket error", ECONNRESET, 5xx | Resume promptly; Pi usually retries these itself, so one that surfaces here has already been retried. |
-| `stream_interrupted` | `context canceled`, empty stderr | The container or Docker died mid-turn (`reason: incomplete_event_stream`). Confirm Docker is healthy (`status --inspect`), then resume. |
-| `timeout` | `--timeout` elapsed | Not a retry candidate as-is: inspect what the worker was doing, then resume with a larger timeout or a narrower assignment. |
-| `context_overflow` | "maximum context length" | Do not resume; start a fresh session whose prompt summarises the state and what remains. |
-| `auth` | 401/403, "invalid API key", "token expired" | Namespace problem; fix credentials, then resume. |
-| `aborted` | Pi aborted the turn | Inspect `events.jsonl` near the end; usually a launcher-side stop. |
-| `worker_exit` | container exited non-zero | Read `stderr.log`; the worker process itself crashed. |
-| `unknown` | anything else | Read the message; treat as non-recoverable until understood. |
+### The escalation ladder
 
-### Resuming after a recoverable failure
+Make exactly one move per rung, and escalate to a human when the same class
+recurs after it. Never make a second attempt of the same kind.
 
-By hand, from the same worktree the failed run used:
+| `recovery` | Classes | Autonomous move | Escalate when |
+| --- | --- | --- | --- |
+| `resume` | `provider_capacity`, `rate_limit`, `transport`, `stream_interrupted` | Wait (30s, 2m, 5m), resume the session as it is. After repeated `provider_capacity`, resume with a fallback `--model` if one is agreed. Do not add parallel workers on the same account while rate-limited. | Attempts are exhausted, or the fallback model is also at capacity. |
+| `resume_adjusted` | `timeout` | Look at `status` for the last tool call: if the worker was stuck on one command, name it in the prompt. Resume once with `--timeout` doubled and a prompt that says to finish and commit verified work first. | A second timeout, or the same command hangs both times. |
+| `resume_adjusted` | `worker_exit`, `aborted`, `unknown` | Read `stderr.log` / the message. Resume once; a resume does not replay actions, so the cost of a wasted attempt is low. Note an `unknown` message so the classifier can learn it. | It recurs, or stderr shows out-of-memory or a broken image. |
+| `restart` | `context_overflow` | Start one fresh session from a handoff prompt: the original assignment, `git status`/`git log`/`git diff --stat` from the worktree, and the old session's last report. Tell it to keep its context small. | The fresh session also overflows: the assignment needs splitting, which is a scoping decision. |
+| `fix_environment` | `auth` | Run `pi-sandbox namespace show` for the worker's namespace. If it reports credentials present, the failure was probably a token refresh: resume once. If the run used a different namespace than the credentialed one, that is a configuration bug to fix. | Credentials are absent or expired: only a human can log in (`pi-sandbox run --namespace NAME`). |
+| `escalate` | launcher errors, `cleanup_failed`, protocol errors, missing result | Confirm Docker is alive (`status --inspect`, `docker info`). | Docker is down, or the container cannot be removed. |
+
+The human-only set is therefore small: expired credentials, a broken Docker
+daemon, an assignment too large for one context even when fresh, and any
+failure that recurs after its one adjusted attempt. Everything else has one
+well-defined move. When you do escalate, report the run directory, the
+class, the message, and which moves were already made.
+
+### Resuming by hand
+
+From the same worktree the failed run used:
 
 ```text
 SESSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["session_files"][0])' BATCH/implement-01/result.json)
@@ -218,16 +227,17 @@ pi-sandbox exec --prompt-file /private/tmp/batch-42/resume.prompt \
 ```
 
 `resume.prompt` should quote the error and tell the worker to run `git status`
-and `git log` before continuing its original assignment. Bound this to two or
-three resumes per worker, and escalate to a human when the same class keeps
-recurring: a model that is at capacity for an hour is a scheduling decision,
-not a retry loop.
+and `git log` before continuing its original assignment. For a `restart`,
+omit `--resume-session` and write the handoff prompt described above.
 
-From a controller, `run_with_recovery` in `assets/orchestrator.py` does the
-same thing: it resumes the recorded session in a fresh `NAME-NN` directory
-after each recoverable failure, with backoff, bounded attempts, an optional
-model fallback after `provider_capacity`, and a log line per decision so the
-orchestrator narrating progress sees why a worker restarted.
+### Recovering from a controller
+
+`run_with_recovery` in `assets/orchestrator.py` walks the ladder for you: it
+follows `error.recovery` after every attempt, resumes or restarts in a fresh
+`NAME-NN` directory, applies backoff, doubles the timeout once, builds the
+handoff prompt, checks credentials before giving up on `auth`, bounds the
+total number of runs, and logs one line per decision so the orchestrator
+narrating progress sees why a worker restarted.
 
 ```python
 attempts = run_with_recovery(
@@ -236,14 +246,16 @@ attempts = run_with_recovery(
     namespace="feature_orchestrator",
     timeout=1800,
     pi_args=["--provider", "PROVIDER", "--model", "MODEL"],
-    max_attempts=3,
+    max_attempts=4,
     backoff_seconds=(30, 120, 300),
     fallback_pi_args=["--provider", "PROVIDER", "--model", "FALLBACK_MODEL"],  # optional
 )
 outcome = attempts[-1]
-require_completed(outcome)   # raises with the classified error if it still failed
+if outcome.escalation:
+    ...  # tell the human: outcome.describe_failure(), outcome.output_dir
+require_completed(outcome)   # raises with the class, message, and escalation reason
 ```
 
-Non-recoverable classes end the loop immediately; the last outcome carries the
-error for the controller to report. A completed resume is still a candidate to
-review like any other run.
+The final outcome's `escalation` is set only when a human is needed, and says
+why. A completed resume or restart is still a candidate to review like any
+other run.

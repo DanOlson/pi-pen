@@ -241,6 +241,7 @@ fn final_agent_error_is_failure_even_when_process_exits_zero() {
     assert_eq!(result["error"]["class"], "unknown");
     assert_eq!(result["error"]["message"], "fixture model error");
     assert_eq!(result["error"]["recoverable"], false);
+    assert_eq!(result["error"]["recovery"], "resume_adjusted");
     let events: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
@@ -695,7 +696,7 @@ fn status_reports_a_batch_from_real_artifacts() {
     assert!(lines[1].starts_with("review-01     failed "), "{table}");
     assert!(
         lines[1].contains(
-            "exit 1  agent_error  unknown (not recoverable): fixture model error  cleanup ok  "
+            "exit 1  agent_error  unknown (resume adjusted): fixture model error  cleanup ok  "
         ),
         "{table}"
     );

@@ -77,15 +77,17 @@ changing anything else.
 | Continue a prior conversation in the same worktree | add `--resume-session <path from result.json.session_files>` |
 | See where every worker in a batch is, without parsing events | `pi-sandbox status --batch DIR [--watch] [--json] [--inspect]` |
 | Cancel one worker only | `pi-sandbox stop --output-dir DIR --grace 10` |
-| Why a worker stopped short, and whether to resume it | `result.json.error` (`class`, `message`, `recoverable`); also in `status` |
+| Why a worker stopped short, and the one move to make next | `result.json.error` (`class`, `message`, `recovery`); also in `status` |
 
 Prefer `--json` forms when a controller consumes the output. The bundled
 starter's `run_worker` allocates `<output_root>/<name>-NN` itself, so calling
 it twice with the same worker name is a retry, not an error, and its
-`run_with_recovery` resumes a worker's session automatically after a
-recoverable failure such as a provider at capacity. A failed run is never a
-reason to stop the batch silently: read the classified error, follow the
-recovery table in the orchestration reference, and report what you did.
+`run_with_recovery` walks the escalation ladder automatically: it resumes
+after a provider at capacity, resumes once with a longer timeout, restarts a
+fresh session after a context overflow, and stops with a stated reason only
+when a human is needed. A failed run is never a reason to stop the batch
+silently: read the classified error, follow the ladder in the orchestration
+reference, and report what you did and why you stopped.
 
 ## Implementation ownership
 

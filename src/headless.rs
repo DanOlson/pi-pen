@@ -128,14 +128,17 @@ struct ResultRecord {
     error: Option<FailureInfo>,
 }
 
-/// Classification of an abnormal stop. `recoverable` means resuming the
-/// recorded session in a fresh output directory is the expected next step
-/// (after checking the worktree); it never means the failure was harmless.
+/// Classification of an abnormal stop. `recovery` names the one autonomous
+/// move an orchestrator should make next (see [`recovery_for`]);
+/// `recoverable` is its shorthand for "resume the session as it is". Neither
+/// means the failure was harmless: resume restores the conversation, not the
+/// worktree.
 #[derive(Debug, Clone, Serialize)]
 pub struct FailureInfo {
     pub class: String,
     pub message: String,
     pub recoverable: bool,
+    pub recovery: &'static str,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -146,11 +149,13 @@ pub struct FailureInfo {
 }
 
 impl FailureInfo {
-    fn simple(class: &str, message: impl Into<String>, recoverable: bool) -> Self {
+    fn simple(class: &str, message: impl Into<String>) -> Self {
+        let recovery = recovery_for(class);
         Self {
             class: class.into(),
             message: message.into(),
-            recoverable,
+            recoverable: recovery == "resume",
+            recovery,
             provider: None,
             model: None,
             diagnostics: Vec::new(),
@@ -172,11 +177,12 @@ impl FailureInfo {
             .and_then(Value::as_array)
             .map(|items| items.iter().map(strip_stacks).collect())
             .unwrap_or_default();
-        let (class, recoverable) = if aborted {
-            ("aborted", false)
+        let class = if aborted {
+            "aborted"
         } else {
             classify_error_message(&text, &diagnostics)
         };
+        let recovery = recovery_for(class);
         Self {
             class: class.into(),
             message: if text.is_empty() {
@@ -187,7 +193,8 @@ impl FailureInfo {
             } else {
                 text
             },
-            recoverable,
+            recoverable: recovery == "resume",
+            recovery,
             provider: message
                 .get("provider")
                 .and_then(Value::as_str)
@@ -214,10 +221,30 @@ fn strip_stacks(value: &Value) -> Value {
     }
 }
 
+/// The escalation ladder: the single autonomous move for each failure class.
+///
+/// - `resume`: transient; resume the session as it is after a backoff.
+/// - `resume_adjusted`: resume once with a changed launch (a longer timeout,
+///   a fresh look at stderr); a second identical failure is an escalation.
+/// - `restart`: the session is unusable; start a fresh one from a handoff
+///   prompt built from the worktree state.
+/// - `fix_environment`: credentials or the runtime, not the assignment; one
+///   configuration check, then a human.
+/// - `escalate`: nothing autonomous is sensible.
+pub fn recovery_for(class: &str) -> &'static str {
+    match class {
+        "provider_capacity" | "rate_limit" | "transport" | "stream_interrupted" => "resume",
+        "timeout" | "worker_exit" | "aborted" | "unknown" => "resume_adjusted",
+        "context_overflow" => "restart",
+        "auth" => "fix_environment",
+        _ => "escalate",
+    }
+}
+
 /// Map a provider error to a coarse class. The message text is provider
 /// prose, so matching is deliberately loose; unknown errors are reported as
-/// such rather than guessed recoverable.
-fn classify_error_message(message: &str, diagnostics: &[Value]) -> (&'static str, bool) {
+/// such rather than guessed transient.
+fn classify_error_message(message: &str, diagnostics: &[Value]) -> &'static str {
     let text = message.to_ascii_lowercase();
     let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
     if has(&[
@@ -228,7 +255,7 @@ fn classify_error_message(message: &str, diagnostics: &[Value]) -> (&'static str
         "503",
         "529",
     ]) {
-        return ("provider_capacity", true);
+        return "provider_capacity";
     }
     if has(&[
         "rate limit",
@@ -237,7 +264,7 @@ fn classify_error_message(message: &str, diagnostics: &[Value]) -> (&'static str
         "429",
         "quota",
     ]) {
-        return ("rate_limit", true);
+        return "rate_limit";
     }
     if has(&[
         "context length",
@@ -247,7 +274,7 @@ fn classify_error_message(message: &str, diagnostics: &[Value]) -> (&'static str
         "prompt is too long",
         "input is too long",
     ]) {
-        return ("context_overflow", false);
+        return "context_overflow";
     }
     if has(&[
         "unauthorized",
@@ -261,7 +288,7 @@ fn classify_error_message(message: &str, diagnostics: &[Value]) -> (&'static str
         "token expired",
         "refresh token",
     ]) {
-        return ("auth", false);
+        return "auth";
     }
     let transport_diagnostic = diagnostics.iter().any(|d| {
         d.get("type")
@@ -286,9 +313,9 @@ fn classify_error_message(message: &str, diagnostics: &[Value]) -> (&'static str
             "internal server error",
         ])
     {
-        return ("transport", true);
+        return "transport";
     }
-    ("unknown", false)
+    "unknown"
 }
 
 struct FailureGuard {
@@ -967,7 +994,6 @@ fn supervise(
                 Some(FailureInfo::simple(
                     "timeout",
                     "run exceeded --timeout before the agent finished",
-                    false,
                 )),
             ));
         }
@@ -1070,7 +1096,6 @@ fn supervise(
                     "stream_interrupted",
                     last_stderr_line(output)
                         .unwrap_or_else(|| "event stream ended before agent_end".into()),
-                    true,
                 ),
             ),
         };
@@ -1209,7 +1234,6 @@ fn outcome(
                 stderr_tail.unwrap_or_else(|| {
                     format!("worker exited with status {}", status.code().unwrap_or(-1))
                 }),
-                false,
             )),
         ))
     }
@@ -2177,6 +2201,7 @@ mod tests {
         }));
         assert_eq!(capacity.class, "provider_capacity");
         assert!(capacity.recoverable);
+        assert_eq!(capacity.recovery, "resume");
         assert_eq!(capacity.provider.as_deref(), Some("openai-codex"));
 
         let transport = FailureInfo::from_assistant_message(&json!({
@@ -2192,12 +2217,14 @@ mod tests {
         }));
         assert_eq!(auth.class, "auth");
         assert!(!auth.recoverable);
+        assert_eq!(auth.recovery, "fix_environment");
 
         let overflow = FailureInfo::from_assistant_message(&json!({
             "role":"assistant","stopReason":"error","errorMessage":"This model's maximum context length is 200000 tokens"
         }));
         assert_eq!(overflow.class, "context_overflow");
         assert!(!overflow.recoverable);
+        assert_eq!(overflow.recovery, "restart");
 
         let aborted = FailureInfo::from_assistant_message(&json!({
             "role":"assistant","stopReason":"aborted"
@@ -2210,12 +2237,18 @@ mod tests {
         }));
         assert_eq!(unknown.class, "unknown");
         assert!(!unknown.recoverable);
+        assert_eq!(unknown.recovery, "resume_adjusted");
+        assert_eq!(
+            FailureInfo::simple("timeout", "x").recovery,
+            "resume_adjusted"
+        );
+        assert_eq!(recovery_for("cleanup_failed"), "escalate");
     }
 
     #[test]
     fn terminal_envelope_carries_reason_and_error() {
         let dir = tempdir().unwrap();
-        let error = FailureInfo::simple("stream_interrupted", "context canceled", true);
+        let error = FailureInfo::simple("stream_interrupted", "context canceled");
         let envelope = terminal_envelope(
             dir.path(),
             Uuid::nil(),
@@ -2228,6 +2261,7 @@ mod tests {
         assert_eq!(envelope["reason"], "incomplete_event_stream");
         assert_eq!(envelope["error"]["class"], "stream_interrupted");
         assert_eq!(envelope["error"]["recoverable"], true);
+        assert_eq!(envelope["error"]["recovery"], "resume");
         let plain = terminal_envelope(dir.path(), Uuid::nil(), "completed", "normal_exit", 0, None)
             .unwrap();
         assert!(plain.get("error").is_none());

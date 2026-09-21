@@ -9,7 +9,7 @@ before the import so no ``__pycache__`` is written into the checkout.
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 import json
 import os
 from pathlib import Path
@@ -38,6 +38,9 @@ class Outcome:
     status: str
     response: str
     result: dict
+    #: Set by ``run_with_recovery`` on the final outcome when it stopped short:
+    #: why a human is needed now.
+    escalation: str | None = None
 
     @property
     def completed(self) -> bool:
@@ -50,26 +53,37 @@ class Outcome:
         return error if isinstance(error, dict) else None
 
     @property
-    def recoverable(self) -> bool:
-        """True when resuming the recorded session is the expected next step.
-
-        The launcher sets this for transient provider failures (capacity,
-        rate limits, transport) and for a stream that died mid-turn. It says
-        nothing about the worktree: resume restores the conversation only.
-        """
+    def recovery(self) -> str:
+        """The launcher's hint for the next move: ``resume``,
+        ``resume_adjusted``, ``restart``, ``fix_environment`` or ``escalate``.
+        A run without a classified error (a launcher failure, a missing
+        result) is ``escalate``."""
         error = self.error
-        return bool(error and error.get("recoverable")) and len(
+        return str(error.get("recovery", "escalate")) if error else "escalate"
+
+    @property
+    def recoverable(self) -> bool:
+        """True when resuming the recorded session as it is is the expected
+        next step: a transient provider, transport, or stream failure with
+        exactly one session file. It says nothing about the worktree: resume
+        restores the conversation only.
+        """
+        return self.recovery == "resume" and len(
             self.result.get("session_files") or []
         ) == 1
 
     def describe_failure(self) -> str:
         error = self.error
         if error is None:
-            return f"exit={self.exit_code} status={self.status}"
-        return (
-            f"exit={self.exit_code} status={self.status} "
-            f"{error.get('class')}: {error.get('message')}"
-        )
+            text = f"exit={self.exit_code} status={self.status}"
+        else:
+            text = (
+                f"exit={self.exit_code} status={self.status} "
+                f"{error.get('class')}: {error.get('message')}"
+            )
+        if self.escalation:
+            text += f"; needs a human: {self.escalation}"
+        return text
 
 
 _active: set[subprocess.Popen] = set()
@@ -264,80 +278,256 @@ def session_file(outcome: Outcome) -> Path:
 RECOVERY_PROMPT = """\
 Your previous run stopped before you finished, for a reason outside your control:
 {error_class}: {error_message}
-
+{advice}
 This is the same conversation, resumed. The worktree is in whatever state you left
 it, including any uncommitted edits. Before doing anything else, run `git status`
 and `git log -3 --oneline` and compare them with your own last steps; then continue
 the original assignment to completion and report as originally instructed.
 """
 
+ADJUSTED_ADVICE = {
+    "timeout": (
+        "The run hit its time limit; this attempt has a longer one. Prefer finishing "
+        "and committing what is already verified over starting new work, and avoid "
+        "long-running commands that are not needed for the assignment."
+    ),
+    "worker_exit": (
+        "The worker process itself exited; if a command you ran could have caused "
+        "that (out of memory, killing the shell), avoid repeating it."
+    ),
+}
+
+HANDOFF_PROMPT = """\
+A previous session working on this assignment ran out of context and could not be
+resumed ({error_message}). You are a fresh session taking over in the same worktree.
+
+## Original assignment
+
+{assignment}
+
+## State the previous session left behind
+
+`git status --porcelain`:
+```
+{git_status}
+```
+
+`git log -5 --oneline`:
+```
+{git_log}
+```
+
+`git diff --stat` (uncommitted):
+```
+{git_diff_stat}
+```
+
+Last progress report from the previous session:
+```
+{last_text}
+```
+
+Verify this state yourself before trusting it, then continue the assignment to
+completion and report as originally instructed. Keep your own context small: read
+only what you need and avoid dumping large files or logs.
+"""
+
+
+def build_handoff_prompt(worker: Worker, outcome: Outcome, template: str = HANDOFF_PROMPT) -> str:
+    """Prompt for a fresh session after ``context_overflow``: the original
+    assignment plus the worktree state and the failed session's last words."""
+    def git(*args: str) -> str:
+        try:
+            text = subprocess.run(
+                ["git", *args], cwd=worker.worktree, check=False,
+                capture_output=True, text=True, timeout=30,
+            ).stdout.strip()
+        except (OSError, subprocess.SubprocessError) as error:
+            text = f"(unavailable: {error})"
+        return text[:4000] or "(clean)"
+    error = outcome.error or {}
+    return template.format(
+        error_message=error.get("message", "context overflow"),
+        assignment=worker.prompt.strip(),
+        git_status=git("status", "--porcelain"),
+        git_log=git("log", "-5", "--oneline"),
+        git_diff_stat=git("diff", "--stat"),
+        last_text=last_assistant_text(outcome) or "(none)",
+    )
+
+
+def last_assistant_text(outcome: Outcome, limit: int = 3000) -> str:
+    """Final assistant prose in the run's session file, for a handoff."""
+    sessions = outcome.result.get("session_files") or []
+    if not sessions:
+        return ""
+    text = ""
+    try:
+        with open(sessions[-1], encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except ValueError:
+                    continue
+                message = entry.get("message") or {}
+                if message.get("role") != "assistant":
+                    continue
+                parts = [
+                    part.get("text", "") for part in message.get("content") or []
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                if any(parts):
+                    text = "\n".join(parts).strip()
+    except OSError:
+        return ""
+    return text[-limit:]
+
+
+def credentials_present(binary: str, worktree: Path, namespace: str | None,
+                        manifest: Path | None) -> bool | None:
+    """Ask the launcher whether the worker's home has Pi credentials; None if unknown."""
+    command = [binary, "namespace", "show", "--json"]
+    if manifest is not None:
+        command.append(str(manifest))
+    if namespace is not None:
+        command.extend(["--namespace", namespace])
+    try:
+        report = subprocess.run(command, cwd=worktree, check=True, capture_output=True,
+                                text=True, timeout=30)
+        return bool(json.loads(report.stdout).get("pi_credentials"))
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+
 
 def run_with_recovery(
     worker: Worker,
     *,
-    max_attempts: int = 3,
+    max_attempts: int = 4,
     backoff_seconds: Sequence[float] = (30, 120, 300),
     fallback_pi_args: Sequence[str] | None = None,
+    timeout_growth: float = 2.0,
     recovery_prompt: str = RECOVERY_PROMPT,
+    handoff_prompt: Callable[[Worker, Outcome], str] = build_handoff_prompt,
     log: Callable[[str], None] | None = None,
     **kwargs,
 ) -> list[Outcome]:
-    """Run a worker and resume its session after recoverable failures.
+    """Run a worker and follow the launcher's recovery hint until it completes
+    or a human is needed.
 
     Returns every attempt's outcome, oldest first; the last one is the final
-    state. A retry only happens when the launcher classified the failure as
-    recoverable (a transient provider or transport error, or a stream that
-    died mid-turn) and recorded exactly one session file. Each retry waits
-    the next ``backoff_seconds`` entry (the last entry repeats), then resumes
-    that session in a fresh ``<name>-NN`` directory with ``recovery_prompt``
-    prepended so the worker re-checks the worktree first.
+    state and, when the loop stopped short, carries ``escalation`` saying why.
+    Each attempt gets its own ``<name>-NN`` directory. The ladder, keyed on
+    ``result.json.error.recovery``:
 
-    ``fallback_pi_args`` replaces ``pi_args`` for the retry after a
-    ``provider_capacity`` failure, for example to switch model. It is off by
-    default because a model swap mid-task is a judgment call.
+    - ``resume`` (capacity, rate limit, transport, interrupted stream): wait
+      the next ``backoff_seconds`` entry (the last repeats), then resume the
+      session with ``recovery_prompt``. ``fallback_pi_args`` replaces
+      ``pi_args`` after a ``provider_capacity`` failure, for example to switch
+      model; off by default because that is a judgment call.
+    - ``resume_adjusted`` (timeout, worker exit, aborted, unknown): resume
+      once per class with a changed launch: a timeout multiplied by
+      ``timeout_growth``, and class-specific advice in the prompt. A second
+      failure of the same class escalates.
+    - ``restart`` (context overflow): start one fresh session from
+      ``handoff_prompt(worker, outcome)``, which by default quotes the
+      assignment, the worktree's git state, and the old session's last report.
+    - ``fix_environment`` (auth): check ``namespace show``; if credentials are
+      present the failure may have been a token refresh, so resume once.
+      Otherwise escalate: only a human can log in.
+    - ``escalate``: stop.
 
-    Anything else (``auth``, ``context_overflow``, ``unknown``, a completed
-    run, an interrupt) ends the loop; reconcile from the last outcome.
+    ``max_attempts`` bounds the total number of runs. Every decision is one
+    ``log`` line so the orchestrator narrating progress can see why a worker
+    restarted.
     """
     if max_attempts < 1:
         raise ValueError("max_attempts must be at least 1")
     if not backoff_seconds:
         raise ValueError("backoff_seconds must not be empty")
+    if timeout_growth < 1:
+        raise ValueError("timeout_growth must be at least 1")
     log = log or (lambda text: print(text, file=sys.stderr, flush=True))
     pi_args = list(kwargs.pop("pi_args", ()))
+    timeout = int(kwargs.pop("timeout", 1800))
     attempts: list[Outcome] = []
+    adjusted_classes: set[str] = set()
+    restarted = False
+    environment_checked = False
     current = worker
+
+    def stop(outcome: Outcome, why: str) -> None:
+        log(f"{worker.name}: {why} ({outcome.describe_failure()}); inspect {outcome.output_dir}")
+        attempts[-1] = replace(outcome, escalation=why)
+
     for attempt in range(1, max_attempts + 1):
-        outcome = run_worker(current, pi_args=pi_args, **kwargs)
+        outcome = run_worker(current, pi_args=pi_args, timeout=timeout, **kwargs)
         attempts.append(outcome)
         if outcome.completed or _interrupted is not None:
             break
-        if not outcome.recoverable:
-            log(f"{worker.name}: not recoverable ({outcome.describe_failure()}); "
-                f"inspect {outcome.output_dir}")
-            break
-        if attempt == max_attempts:
-            log(f"{worker.name}: giving up after {attempt} attempts "
-                f"({outcome.describe_failure()}); inspect {outcome.output_dir}")
-            break
         error = outcome.error or {}
-        if fallback_pi_args is not None and error.get("class") == "provider_capacity":
-            pi_args = list(fallback_pi_args)
-            log(f"{worker.name}: switching to fallback pi args for the next attempt")
+        error_class = error.get("class", "unknown")
+        recovery = outcome.recovery
+        sessions = outcome.result.get("session_files") or []
+        if attempt == max_attempts:
+            stop(outcome, f"giving up after {attempt} attempts")
+            break
+        advice = ""
+        resume = True
+        if recovery == "resume":
+            if fallback_pi_args is not None and error_class == "provider_capacity":
+                pi_args = list(fallback_pi_args)
+                log(f"{worker.name}: switching to fallback pi args for the next attempt")
+        elif recovery == "resume_adjusted":
+            if error_class in adjusted_classes:
+                stop(outcome, f"{error_class} recurred after an adjusted attempt")
+                break
+            adjusted_classes.add(error_class)
+            advice = ADJUSTED_ADVICE.get(error_class, "")
+            if error_class == "timeout":
+                timeout = int(timeout * timeout_growth)
+                log(f"{worker.name}: raising timeout to {timeout}s for the next attempt")
+        elif recovery == "restart":
+            if restarted:
+                stop(outcome, "a fresh session also overflowed its context; split the assignment")
+                break
+            restarted = True
+            resume = False
+        elif recovery == "fix_environment":
+            if environment_checked:
+                stop(outcome, "credentials still failing; a human must re-authenticate")
+                break
+            environment_checked = True
+            present = credentials_present(
+                kwargs.get("binary", "pi-sandbox"), worker.worktree,
+                kwargs.get("namespace"), kwargs.get("manifest"))
+            if not present:
+                stop(outcome, "the worker's home has no pi credentials; a human must log in")
+                break
+            log(f"{worker.name}: credentials are present; treating {error_class} as transient once")
+        else:
+            stop(outcome, "no autonomous recovery for this failure")
+            break
+        if resume and len(sessions) != 1:
+            stop(outcome, f"cannot resume: {len(sessions)} session files recorded")
+            break
         delay = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
         log(f"{worker.name}: attempt {attempt}/{max_attempts} stopped "
-            f"({outcome.describe_failure()}); resuming in {delay:g}s")
+            f"({outcome.describe_failure()}); {recovery} in {delay:g}s")
         if not _interruptible_sleep(delay):
             break
-        current = Worker(
-            worker.name,
-            worker.worktree,
-            recovery_prompt.format(
-                error_class=error.get("class", "unknown"),
-                error_message=error.get("message", ""),
-            ),
-            resume_session=session_file(outcome),
-        )
+        if resume:
+            current = Worker(
+                worker.name,
+                worker.worktree,
+                recovery_prompt.format(
+                    error_class=error_class,
+                    error_message=error.get("message", ""),
+                    advice=f"\n{advice}\n" if advice else "",
+                ),
+                resume_session=session_file(outcome),
+            )
+        else:
+            current = Worker(worker.name, worker.worktree, handoff_prompt(worker, outcome))
     return attempts
 
 

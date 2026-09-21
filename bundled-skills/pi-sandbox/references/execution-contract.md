@@ -114,14 +114,15 @@ Use both the launcher exit status and `OUTPUT/result.json`:
   tested. Inspect the response, branch, diff, commit, and test evidence.
 - A missing result is a failure even if some output exists.
 - Check `cleanup_succeeded`; uncertain cleanup requires reconciliation.
-- A failed run's `error` field (`class`, `message`, `recoverable`, and the
-  provider's own diagnostics) says why the model or transport stopped. It is
-  also on the `run_finished` stdout envelope and in `pi-sandbox status`. The
-  orchestration reference maps each class to a recovery.
+- A failed run's `error` field (`class`, `message`, `recovery`,
+  `recoverable`, and the provider's own diagnostics) says why the model,
+  transport, or container stopped and names the one autonomous move to make
+  next. It is also on the `run_finished` stdout envelope and in
+  `pi-sandbox status`. The orchestration reference has the escalation ladder.
 - Do not blindly retry. The prior worker may already have changed files,
-  commits, databases, or external systems. A `recoverable` error means
-  resuming the session is the right next step after checking the worktree,
-  not that nothing happened.
+  commits, databases, or external systems. `recovery: resume` means resuming
+  the session is the right next step after checking the worktree, not that
+  nothing happened.
 
 Keep each output directory for diagnosis and possible continuation. Select an
 actual path from `result.json.session_files` when using `--resume-session`; a

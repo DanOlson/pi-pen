@@ -69,6 +69,7 @@ pub struct FailureSummary {
     pub class: String,
     pub message: String,
     pub recoverable: bool,
+    pub recovery: String,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -213,6 +214,11 @@ fn read_run_status(dir: &Path, inspect: bool) -> RunStatus {
                 .get("recoverable")
                 .and_then(Value::as_bool)
                 .unwrap_or(false),
+            recovery: value
+                .get("recovery")
+                .and_then(Value::as_str)
+                .unwrap_or("escalate")
+                .to_owned(),
         })
     });
     let stderr_tail = if status.as_deref().is_some_and(|s| s != "completed") {
@@ -481,14 +487,10 @@ fn describe(run: &RunStatus) -> Vec<String> {
             details.push(reason.clone());
         }
         if let Some(error) = &run.error {
-            let verdict = if error.recoverable {
-                "recoverable"
-            } else {
-                "not recoverable"
-            };
             details.push(format!(
-                "{} ({verdict}): {}",
+                "{} ({}): {}",
                 error.class,
+                error.recovery.replace('_', " "),
                 truncate(&error.message, TEXT_WIDTH)
             ));
         }
@@ -697,7 +699,7 @@ mod tests {
         fs::write(
             dir.join("result.json"),
             json!({"status":"failed","reason":"agent_error","wrapper_exit_code":1,"container_exit_code":0,"started_at_unix_ms":0,"finished_at_unix_ms":3000,"cleanup_succeeded":true,
-                "error":{"class":"provider_capacity","message":"Selected model is at capacity. Please try a different model.","recoverable":true}}).to_string(),
+                "error":{"class":"provider_capacity","message":"Selected model is at capacity. Please try a different model.","recoverable":true,"recovery":"resume"}}).to_string(),
         )
         .unwrap();
         fs::write(dir.join("stderr.log"), "context canceled\n").unwrap();
@@ -705,7 +707,7 @@ mod tests {
         let table = render_table(std::slice::from_ref(&run));
         assert!(
             table.contains(
-                "agent_error  provider_capacity (recoverable): Selected model is at capacity."
+                "agent_error  provider_capacity (resume): Selected model is at capacity."
             ),
             "{table}"
         );
@@ -716,7 +718,7 @@ mod tests {
         fs::write(
             interrupted.join("result.json"),
             json!({"status":"failed","reason":"incomplete_event_stream","wrapper_exit_code":1,"container_exit_code":1,"started_at_unix_ms":0,"finished_at_unix_ms":3000,"cleanup_succeeded":true,
-                "error":{"class":"stream_interrupted","message":"context canceled","recoverable":true}}).to_string(),
+                "error":{"class":"stream_interrupted","message":"context canceled","recoverable":true,"recovery":"resume"}}).to_string(),
         )
         .unwrap();
         fs::write(interrupted.join("stderr.log"), "context canceled\n").unwrap();

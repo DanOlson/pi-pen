@@ -18,8 +18,11 @@ SKILL_RUNNER = importlib.util.module_from_spec(SKILL_RUNNER_SPEC)
 sys.modules[SKILL_RUNNER_SPEC.name] = SKILL_RUNNER
 SKILL_RUNNER_SPEC.loader.exec_module(SKILL_RUNNER)
 FAKE = '''#!/usr/bin/env python3
-import json, pathlib, signal, sys, time
+import json, os, pathlib, signal, sys, time
 args = sys.argv
+if args[1] == 'namespace':
+    print(json.dumps({'pi_credentials': 'CREDS' in os.environ.get('FAKE_NAMESPACE', '')}))
+    sys.exit(0)
 out = pathlib.Path(args[args.index('--output-dir') + 1])
 # Like the real launcher: a nonexistent or existing-but-empty directory is fresh.
 out.mkdir(exist_ok=True)
@@ -36,18 +39,25 @@ if prompt == 'missing':
 def finish(code, status, **extra):
     (out / 'result.json').write_text(json.dumps({'status':status, **extra}))
     sys.exit(code)
-if prompt.startswith('capacity'):
-    # A transient provider failure: the launcher records the classified error
-    # and the session file that a resume would continue from.
+def fail_with(cls, recovery, message):
+    # Like the real launcher: a classified error plus the session file a
+    # resume would continue from.
     (out / 'sessions').mkdir()
-    session = out / 'sessions' / 'session.jsonl'
-    session.write_text('{}\\n')
-    finish(1, 'failed', reason='agent_error', session_files=[str(session)],
-           error={'class':'provider_capacity','recoverable':True,
-                  'message':'Selected model is at capacity. Please try a different model.'})
+    path = out / 'sessions' / 'session.jsonl'
+    path.write_text(json.dumps({'type':'message','message':{'role':'assistant',
+        'content':[{'type':'text','text':'I finished step one; step two remains.'}]}}) + '\\n')
+    finish(1, 'failed', reason='agent_error', session_files=[str(path)],
+           error={'class':cls,'recovery':recovery,'recoverable':recovery == 'resume',
+                  'message':message})
+if prompt.startswith('capacity'):
+    fail_with('provider_capacity', 'resume',
+              'Selected model is at capacity. Please try a different model.')
+if prompt.startswith('timeout'):
+    fail_with('timeout', 'resume_adjusted', 'run exceeded --timeout before the agent finished')
+if prompt.startswith('overflow'):
+    fail_with('context_overflow', 'restart', 'maximum context length exceeded')
 if prompt == 'auth':
-    finish(1, 'failed', reason='agent_error', session_files=[],
-           error={'class':'auth','recoverable':False,'message':'401 Unauthorized'})
+    fail_with('auth', 'fix_environment', '401 Unauthorized')
 signal.signal(signal.SIGTERM, lambda *args: finish(143, 'cancelled'))
 (out / 'started').write_text(str(pathlib.Path.cwd()))
 if prompt == 'slow':
@@ -189,18 +199,25 @@ class ExamplesTest(unittest.TestCase):
         self.assertTrue((self.root / 'skill-run/skill-worker-01/args.json').is_file())
 
 
-    def test_run_with_recovery_resumes_recoverable_failures(self):
-        # Prompt "capacity" fails; the resumed prompt (the recovery text) succeeds.
+    def recover(self, name, prompt, worktree=0, **kwargs):
         logs = []
+        kwargs.setdefault('log', logs.append)
         attempts = SKILL_RUNNER.run_with_recovery(
-            SKILL_RUNNER.Worker('flaky', self.worktrees[0], 'capacity'),
+            SKILL_RUNNER.Worker(name, self.worktrees[worktree], prompt),
             output_root=self.root / 'recover', binary=str(self.binary), timeout=10,
-            backoff_seconds=(0,), max_attempts=3, log=logs.append,
+            backoff_seconds=(0,), **kwargs)
+        return attempts, logs
+
+    def test_run_with_recovery_resumes_transient_failures(self):
+        # Prompt "capacity" fails; the resumed prompt (the recovery text) succeeds.
+        attempts, logs = self.recover(
+            'flaky', 'capacity', max_attempts=3,
             pi_args=['--model', 'primary'], fallback_pi_args=['--model', 'backup'])
         self.assertEqual([a.status for a in attempts], ['failed', 'completed'])
         first, second = attempts
         self.assertEqual(first.error['class'], 'provider_capacity')
         self.assertTrue(first.recoverable)
+        self.assertIsNone(second.escalation)
         self.assertEqual(second.output_dir, self.root / 'recover/flaky-02')
         args = json.loads((second.output_dir / 'args.json').read_text())
         self.assertEqual(args[args.index('--resume-session') + 1],
@@ -209,28 +226,64 @@ class ExamplesTest(unittest.TestCase):
         resumed_prompt = (self.root / 'recover/flaky-02.prompt.txt').read_text()
         self.assertIn('provider_capacity: Selected model is at capacity', resumed_prompt)
         self.assertIn('git status', resumed_prompt)
-        self.assertTrue(any('resuming in 0s' in line for line in logs), logs)
+        self.assertTrue(any('resume in 0s' in line for line in logs), logs)
 
-    def test_run_with_recovery_stops_on_unrecoverable_and_bounded_attempts(self):
-        attempts = SKILL_RUNNER.run_with_recovery(
-            SKILL_RUNNER.Worker('locked', self.worktrees[0], 'auth'),
-            output_root=self.root / 'recover', binary=str(self.binary), timeout=10,
-            backoff_seconds=(0,), log=lambda _: None)
+    def test_run_with_recovery_adjusts_once_for_timeouts(self):
+        attempts, _ = self.recover('slowpoke', 'timeout', timeout_growth=3)
+        self.assertEqual([a.status for a in attempts], ['failed', 'completed'])
+        args = json.loads((attempts[1].output_dir / 'args.json').read_text())
+        self.assertEqual(args[args.index('--timeout') + 1], '30')
+        prompt = (self.root / 'recover/slowpoke-02.prompt.txt').read_text()
+        self.assertIn('time limit', prompt)
+
+        # A second timeout in a row is an escalation, not another attempt.
+        attempts, _ = self.recover(
+            'stuck', 'timeout', worktree=1,
+            recovery_prompt='timeout again {error_class} {error_message}{advice}')
+        self.assertEqual([a.status for a in attempts], ['failed', 'failed'])
+        self.assertIn('recurred after an adjusted attempt', attempts[-1].escalation)
+        with self.assertRaisesRegex(RuntimeError, 'needs a human: timeout recurred'):
+            SKILL_RUNNER.require_completed(attempts[-1])
+
+    def test_run_with_recovery_restarts_after_context_overflow(self):
+        subprocess.run(['git', '-c', 'user.name=T', '-c', 'user.email=t@x.invalid',
+                        'commit', '-q', '--allow-empty', '-m', 'progress: step one'],
+                       cwd=self.worktrees[0], check=True, capture_output=True)
+        attempts, _ = self.recover('bloated', 'overflow: do the thing')
+        self.assertEqual([a.status for a in attempts], ['failed', 'completed'])
+        args = json.loads((attempts[1].output_dir / 'args.json').read_text())
+        self.assertNotIn('--resume-session', args)
+        handoff = (self.root / 'recover/bloated-02.prompt.txt').read_text()
+        self.assertIn('overflow: do the thing', handoff)
+        self.assertIn('progress: step one', handoff)
+        self.assertIn('I finished step one; step two remains.', handoff)
+
+        attempts, _ = self.recover('hopeless', 'overflow', worktree=1,
+                                   handoff_prompt=lambda w, o: 'overflow again')
+        self.assertEqual([a.status for a in attempts], ['failed', 'failed'])
+        self.assertIn('split the assignment', attempts[-1].escalation)
+
+    def test_run_with_recovery_checks_credentials_before_escalating(self):
+        attempts, _ = self.recover('locked', 'auth')
         self.assertEqual(len(attempts), 1)
-        self.assertFalse(attempts[0].recoverable)
-        with self.assertRaisesRegex(RuntimeError, 'auth: 401 Unauthorized'):
+        self.assertEqual(attempts[0].recovery, 'fix_environment')
+        self.assertIn('human must log in', attempts[0].escalation)
+        with self.assertRaisesRegex(RuntimeError, 'auth: 401 Unauthorized; needs a human'):
             SKILL_RUNNER.require_completed(attempts[0])
 
-        # Every attempt fails the same way: bounded by max_attempts. The fake
-        # keeps failing because the resumed prompt is rewritten to start with
-        # "capacity" below.
-        attempts = SKILL_RUNNER.run_with_recovery(
-            SKILL_RUNNER.Worker('down', self.worktrees[1], 'capacity'),
-            output_root=self.root / 'recover', binary=str(self.binary), timeout=10,
-            backoff_seconds=(0,), max_attempts=2, log=lambda _: None,
-            recovery_prompt='capacity again: {error_class} {error_message}')
+        os.environ['FAKE_NAMESPACE'] = 'CREDS'
+        self.addCleanup(os.environ.pop, 'FAKE_NAMESPACE', None)
+        attempts, logs = self.recover('refreshed', 'auth', worktree=1)
+        self.assertEqual([a.status for a in attempts], ['failed', 'completed'])
+        self.assertTrue(any('transient once' in line for line in logs), logs)
+
+    def test_run_with_recovery_is_bounded(self):
+        attempts, _ = self.recover(
+            'down', 'capacity', max_attempts=2,
+            recovery_prompt='capacity again: {error_class} {error_message}{advice}')
         self.assertEqual([a.status for a in attempts], ['failed', 'failed'])
         self.assertEqual(attempts[1].output_dir, self.root / 'recover/down-02')
+        self.assertIn('giving up after 2 attempts', attempts[-1].escalation)
 
 
 if __name__ == '__main__':
