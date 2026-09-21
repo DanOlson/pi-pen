@@ -43,7 +43,8 @@ should not edit or commit. Ask it to state explicitly when it found no issues
 and to identify residual testing gaps.
 
 Make the read-only boundary concrete. Launch reviewers with
-`-- --tools read,bash` so they have no edit or write tool, and include:
+`-- --tools read,bash` so they have no edit tool. `bash` can still write, and
+the reviewer normally runs in the implementer's worktree, so include:
 
 ```text
 Do not modify, delete, clean, or rebuild anything outside normal test runs:
@@ -53,8 +54,10 @@ or `git stash`. Build caches may be shared with other workers. Report
 they differ, say what changed and why.
 ```
 
-A reviewer's view of untracked or ignored files is its own worktree's, not the
-host's; the orchestrator verifies host state from the host.
+A reviewer's view of untracked or ignored files is its container's view of
+the worktree, not the host's; the orchestrator verifies host state from the
+host, and compares `git status --porcelain` before and after a review that
+shares the implementer's worktree.
 
 ## Revision assignment
 

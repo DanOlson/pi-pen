@@ -116,11 +116,15 @@ cancel the others. SIGINT/SIGTERM terminates active launchers, waits for cleanup
 and attempts targeted `stop` if a launcher does not exit. Worktrees and outputs
 are preserved. This is a small batch example, not a persistent job scheduler.
 
-All three example worktrees start from the same commit. A review of the newly
-implemented feature must be a **subsequent** job, after the implementation is
-committed and that commit is placed in the review worktree. The orchestrator must
-manage dependencies, inspect diffs, run checks, and decide whether to merge;
-`completed` does not mean the feature is correct. No automatic merge is performed.
+All three example jobs run concurrently, which is why each has its own
+worktree; the `review` job reviews the existing code, not the new feature. A
+review of the newly implemented feature must be a **subsequent** job, after the
+implementation is committed. Run it in the implementation worktree: a headless
+run releases its worktree lock on exit, and the reviewer then sees the commit
+and anything left uncommitted. A separate detached worktree is only needed for
+reviewers that run at the same time. The orchestrator must manage dependencies,
+inspect diffs, run checks, and decide whether to merge; `completed` does not
+mean the feature is correct. No automatic merge is performed.
 
 Containers do not automatically isolate external databases. Configure `[run]`
 networks, env files, and namespace-specific connection settings separately in
