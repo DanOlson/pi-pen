@@ -402,9 +402,10 @@ def credentials_present(binary: str, worktree: Path, namespace: str | None,
 def run_with_recovery(
     worker: Worker,
     *,
-    max_attempts: int = 4,
+    max_attempts: int = 5,
     backoff_seconds: Sequence[float] = (30, 120, 300),
     fallback_pi_args: Sequence[str] | None = None,
+    fallback_after: int = 2,
     timeout_growth: float = 2.0,
     recovery_prompt: str = RECOVERY_PROMPT,
     handoff_prompt: Callable[[Worker, Outcome], str] = build_handoff_prompt,
@@ -421,12 +422,14 @@ def run_with_recovery(
 
     - ``resume`` (capacity, rate limit, transport, interrupted stream): wait
       the next ``backoff_seconds`` entry (the last repeats), then resume the
-      session with ``recovery_prompt``. After a ``provider_capacity`` failure
-      the next attempt swaps ``pi_args`` and ``fallback_pi_args``, so the
-      worker alternates between the primary and fallback model for as long as
-      capacity errors continue: a fallback that is itself at capacity hands
-      back to the primary. Off by default because a model swap mid-task is a
-      judgment call; see the orchestration reference for choosing the pair.
+      session with ``recovery_prompt``. After ``fallback_after`` consecutive
+      ``provider_capacity`` failures on the same model the next attempt swaps
+      ``pi_args`` and ``fallback_pi_args``, so a single blip gets one backoff
+      and retry on the primary first, and the worker then alternates between
+      the pair for as long as capacity errors continue: a fallback that is
+      itself at capacity hands back to the primary. Off by default because a
+      model swap mid-task is a judgment call; see the orchestration reference
+      for choosing the pair.
     - ``resume_adjusted`` (timeout, worker exit, aborted, unknown): resume
       once per class with a changed launch: a timeout multiplied by
       ``timeout_growth``, and class-specific advice in the prompt. A second
@@ -439,7 +442,8 @@ def run_with_recovery(
       Otherwise escalate: only a human can log in.
     - ``escalate``: stop.
 
-    ``max_attempts`` bounds the total number of runs. Every decision is one
+    ``max_attempts`` bounds the total number of runs; the default of 5 gives
+    each model of a pair its two tries plus one swap back. Every decision is one
     ``log`` line so the orchestrator narrating progress can see why a worker
     restarted.
     """
@@ -449,9 +453,12 @@ def run_with_recovery(
         raise ValueError("backoff_seconds must not be empty")
     if timeout_growth < 1:
         raise ValueError("timeout_growth must be at least 1")
+    if fallback_after < 1:
+        raise ValueError("fallback_after must be at least 1")
     log = log or (lambda text: print(text, file=sys.stderr, flush=True))
     pi_args = list(kwargs.pop("pi_args", ()))
     alternate_pi_args = list(fallback_pi_args) if fallback_pi_args is not None else None
+    capacity_streak = 0  # consecutive provider_capacity failures on the current pi_args
     timeout = int(kwargs.pop("timeout", 1800))
     attempts: list[Outcome] = []
     adjusted_classes: set[str] = set()
@@ -477,10 +484,13 @@ def run_with_recovery(
             break
         advice = ""
         resume = True
+        capacity_streak = capacity_streak + 1 if error_class == "provider_capacity" else 0
         if recovery == "resume":
-            if alternate_pi_args is not None and error_class == "provider_capacity":
+            if alternate_pi_args is not None and capacity_streak >= fallback_after:
                 pi_args, alternate_pi_args = alternate_pi_args, pi_args
-                log(f"{worker.name}: swapping to {_describe_model(pi_args)} for the next attempt")
+                capacity_streak = 0
+                log(f"{worker.name}: {fallback_after} capacity failures in a row; "
+                    f"swapping to {_describe_model(pi_args)} for the next attempt")
         elif recovery == "resume_adjusted":
             if error_class in adjusted_classes:
                 stop(outcome, f"{error_class} recurred after an adjusted attempt")

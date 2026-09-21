@@ -200,7 +200,7 @@ recurs after it. Never make a second attempt of the same kind.
 
 | `recovery` | Classes | Autonomous move | Escalate when |
 | --- | --- | --- | --- |
-| `resume` | `provider_capacity`, `rate_limit`, `transport`, `stream_interrupted` | Wait (30s, 2m, 5m), resume the session as it is. On `provider_capacity`, swap to the other model of the agreed pair (below) for the next attempt. Do not add parallel workers on the same account while rate-limited. | Attempts are exhausted, or both models of the pair are at capacity back to back. |
+| `resume` | `provider_capacity`, `rate_limit`, `transport`, `stream_interrupted` | Wait (30s, 2m, 5m), resume the session as it is. After two `provider_capacity` failures in a row on the same model, swap to the other model of the agreed pair (below). Do not add parallel workers on the same account while rate-limited. | Attempts are exhausted, or both models of the pair are at capacity back to back. |
 | `resume_adjusted` | `timeout` | Look at `status` for the last tool call: if the worker was stuck on one command, name it in the prompt. Resume once with `--timeout` doubled and a prompt that says to finish and commit verified work first. | A second timeout, or the same command hangs both times. |
 | `resume_adjusted` | `worker_exit`, `aborted`, `unknown` | Read `stderr.log` / the message. Resume once; a resume does not replay actions, so the cost of a wasted attempt is low. Note an `unknown` message so the classifier can learn it. | It recurs, or stderr shows out-of-memory or a broken image. |
 | `restart` | `context_overflow` | Start one fresh session from a handoff prompt: the original assignment, `git status`/`git log`/`git diff --stat` from the worktree, and the old session's last report. Tell it to keep its context small. | The fresh session also overflows: the assignment needs splitting, which is a scoping decision. |
@@ -216,10 +216,11 @@ class, the message, and which moves were already made.
 ### Choosing a fallback model
 
 Capacity is per model and transient, so treat the primary and fallback as a
-pair to alternate between, not a one-way downgrade: a capacity error on the
-primary moves the next attempt to the fallback, and a capacity error on the
-fallback moves it back. Work does not get stranded on the weaker model by a
-single blip, and the run never waits on a model that has just said no.
+pair to alternate between, not a one-way downgrade. A single capacity error
+is often a blip: retry the same model once after the backoff. Two in a row
+on the same model moves the next attempt to the other one, and the same rule
+brings it back. Work does not get stranded on the weaker model by one bad
+minute, and a model that keeps saying no is not waited on for long.
 
 Pick the pair so that a swap changes nothing except the model:
 
@@ -272,9 +273,10 @@ attempts = run_with_recovery(
     namespace="feature_orchestrator",
     timeout=1800,
     pi_args=["--provider", "PROVIDER", "--model", "MODEL"],
-    max_attempts=4,
+    max_attempts=5,
     backoff_seconds=(30, 120, 300),
-    fallback_pi_args=["--provider", "PROVIDER", "--model", "FALLBACK_MODEL"],  # alternates on capacity
+    fallback_pi_args=["--provider", "PROVIDER", "--model", "FALLBACK_MODEL"],  # optional
+    fallback_after=2,  # consecutive capacity failures on one model before swapping
 )
 outcome = attempts[-1]
 if outcome.escalation:
