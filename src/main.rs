@@ -42,6 +42,8 @@ enum Command {
     Rpc(RpcArgs),
     /// Stop the exact managed container recorded in an output directory.
     Stop(StopArgs),
+    /// Show where headless runs are, from their output directories alone.
+    Status(StatusArgs),
     /// Install agent skills for using pi-sandbox programmatically.
     Skills {
         #[command(subcommand)]
@@ -252,6 +254,28 @@ struct StopArgs {
 }
 
 #[derive(Debug, Args)]
+struct StatusArgs {
+    /// One run's output directory.
+    #[arg(long, required_unless_present = "batch", conflicts_with = "batch")]
+    output_dir: Option<PathBuf>,
+    /// A batch directory; every subdirectory holding a run.json is listed.
+    #[arg(long)]
+    batch: Option<PathBuf>,
+    /// Refresh until every run is terminal.
+    #[arg(long)]
+    watch: bool,
+    /// Seconds between refreshes with --watch.
+    #[arg(long, default_value_t = 2, requires = "watch", value_parser = clap::value_parser!(u64).range(1..))]
+    interval: u64,
+    /// Print JSON instead of a table (one snapshot per line with --watch).
+    #[arg(long)]
+    json: bool,
+    /// Ask Docker whether each running worker's container is still alive.
+    #[arg(long)]
+    inspect: bool,
+}
+
+#[derive(Debug, Args)]
 struct InitArgs {
     /// Use defaults and do not prompt.
     #[arg(long)]
@@ -363,6 +387,17 @@ impl From<Cli> for pi_sandbox::Cli {
                         grace: args.grace,
                     })
                 }
+                Command::Status(args) => pi_sandbox::Command::Status(pi_sandbox::status::Options {
+                    target: match (args.output_dir, args.batch) {
+                        (Some(dir), _) => pi_sandbox::status::Target::Run(dir),
+                        (None, Some(batch)) => pi_sandbox::status::Target::Batch(batch),
+                        (None, None) => unreachable!("clap requires one status target"),
+                    },
+                    watch: args.watch,
+                    json: args.json,
+                    inspect: args.inspect,
+                    interval: args.interval,
+                }),
                 Command::Namespace { command } => pi_sandbox::Command::Namespace {
                     command: match command {
                         NamespaceCommand::Show(args) => pi_sandbox::NamespaceCommand::Show {

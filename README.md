@@ -43,6 +43,7 @@ pi-sandbox run [ENV] [--rebuild] [--pull] [network options] [-- <pi args...>]
 pi-sandbox exec [ENV] (--prompt-file PATH | --prompt-stdin) (--output-dir PATH | --new-run-under DIR [--run-name NAME]) [--timeout SECONDS] [-- <pi options...>]
 pi-sandbox rpc [ENV] (--output-dir PATH | --new-run-under DIR [--run-name NAME]) [--timeout SECONDS] [-- <pi options...>]
 pi-sandbox stop --output-dir PATH [--grace SECONDS]
+pi-sandbox status (--output-dir PATH | --batch DIR) [--watch [--interval SECONDS]] [--json] [--inspect]
 pi-sandbox build [ENV] [--rebuild] [--pull]
 pi-sandbox env list
 pi-sandbox env show [ENV]

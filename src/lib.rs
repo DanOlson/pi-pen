@@ -24,6 +24,7 @@ const DEFAULT_PI_INSTALL: &str =
 
 pub mod headless;
 pub mod skills;
+pub mod status;
 const DEFAULT_PACKAGES: &[&str] = &[
     "bash",
     "ca-certificates",
@@ -100,6 +101,7 @@ pub enum Command {
         overrides: RunOverrides,
     },
     Headless(headless::HeadlessCommand),
+    Status(status::Options),
     Skills {
         command: SkillsCommand,
     },
@@ -306,6 +308,9 @@ pub fn run_cli(cli: Cli) -> Result<()> {
         }
         Command::Headless(command) => {
             headless::run(command, &cli.cwd)?;
+        }
+        Command::Status(options) => {
+            status::run(options, &cli.cwd)?;
         }
         Command::Skills { command } => match command {
             SkillsCommand::Install(options) => skills::install(&cli.cwd, options)?,

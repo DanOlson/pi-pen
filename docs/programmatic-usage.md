@@ -167,6 +167,35 @@ Directories are private (0700), files 0600. `usage`, when present, describes the
 final assistant message, not total session usage. Do not blindly retry a failed
 agent: its filesystem or database side effects may already have happened.
 
+## Watching progress
+
+`events.jsonl` is dominated by token deltas and partial tool output, so it is
+a poor progress view. `status` derives one line per run from `run.json`, the
+significant events, and `result.json`:
+
+```sh
+pi-sandbox status --batch /tmp/pi-runs/batch-001
+pi-sandbox status --output-dir /tmp/pi-runs/task-001 --json
+```
+
+```text
+implement-01  running     14m32s  bash: cargo test --lib  idle 2m10s  last: "Added regression test for…"
+review-01     completed    6m05s  exit 0  cleanup ok
+review-02     failed       0m03s  exit 1  worker_exit  cleanup ok  warning: no saved pi credentials…
+```
+
+A running line shows the tool call still executing (or `awaiting model`
+between tool calls), how long `events.jsonl` has been quiet, and the last
+assistant text. Pi events carry no timestamps, so `idle` is the age of the last
+event write, not the age of the tool call. A terminal line shows the wrapper
+exit code, the reason when not `completed`, cleanup state, and the last
+`stderr.log` line for failures. `--batch DIR` lists every subdirectory with a
+`run.json`; `--watch` redraws every `--interval` seconds until all runs are
+terminal; `--json` prints the same fields for a controller (one snapshot per
+line with `--watch`); `--inspect` additionally asks Docker whether each running
+worker's container is alive, which is how a launcher killed with SIGKILL shows
+up: `run.json` still says `running` while the container is missing or exited.
+
 ## Cancellation and continuation
 
 To cancel one worker without touching others:

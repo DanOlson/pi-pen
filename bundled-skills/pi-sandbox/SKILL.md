@@ -75,6 +75,7 @@ changing anything else.
 | Run one assignment into an exact fresh directory | `pi-sandbox exec --prompt-file P --output-dir DIR --timeout S -- PI_OPTS` |
 | Run one assignment into an allocated `NAME-NN` directory (retries) | `pi-sandbox exec --prompt-file P --new-run-under BATCH --run-name NAME ...` |
 | Continue a prior conversation in the same worktree | add `--resume-session <path from result.json.session_files>` |
+| See where every worker in a batch is, without parsing events | `pi-sandbox status --batch DIR [--watch] [--json] [--inspect]` |
 | Cancel one worker only | `pi-sandbox stop --output-dir DIR --grace 10` |
 
 Prefer `--json` forms when a controller consumes the output. The bundled

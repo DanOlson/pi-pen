@@ -134,17 +134,26 @@ revisions. Use RPC only when live steering materially improves the workflow.
 ## Monitoring a running worker
 
 `events.jsonl` is a durable protocol log, not a progress view: it is dominated
-by token deltas and partial tool output. To see where a worker is, read
-`run.json` for `state` and `container_id`, then filter events by type:
+by token deltas and partial tool output. Use `status` instead of parsing it:
 
-```text
-jq -c 'select(.type=="pi_event") | .event | select(.type|test("^(tool_execution_(start|end)|turn_|agent_)")) | {type, tool: .toolName, args: .args.command}' OUTPUT/events.jsonl | tail -n 5
+```sh
+pi-sandbox status --batch BATCH            # one line per run directory
+pi-sandbox status --output-dir OUTPUT --json
+pi-sandbox status --batch BATCH --watch    # redraw until every run is terminal
 ```
 
+A running line names the tool call still executing (`bash: cargo test --lib`)
+or `awaiting model`, how long `events.jsonl` has been quiet (`idle 2m10s`), and
+the last assistant text. A terminal line shows the exit code, the reason when
+not `completed`, cleanup state, and the last `stderr.log` line for failures.
+The `--json` form carries the same fields (`state`, `status`, `phase`, `tool`,
+`idle_ms`, `last_text`, ...) for a controller that narrates progress.
+
 `response.txt` and `result.json` appear only at the end; their absence means
-the worker is still running or the launcher died. If `stderr.log` is quiet and
-`run.json` has not been updated for longer than a tool call should take, use
-`docker inspect <container_id>` before deciding the worker is stuck.
+the worker is still running or the launcher died. A long `idle` during a tool
+call that should be quick, with a quiet `stderr.log`, is the stuck-worker
+signal; run `status --inspect` to have Docker confirm the container is alive
+before deciding.
 
 ## Failure handling
 

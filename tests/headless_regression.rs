@@ -639,3 +639,69 @@ fn namespace_list_reports_metadata_credentials_and_age() {
     assert!(listings[0]["last_used_unix_ms"].as_u64().unwrap() > 0);
     assert_eq!(listings[0]["metadata"]["shared"], false);
 }
+
+#[test]
+fn status_reports_a_batch_from_real_artifacts() {
+    let fixture = Fixture::new();
+    let batch = fixture.root.path().join("batch");
+    fs::create_dir(&batch).unwrap();
+    fs::create_dir(batch.join("prompts")).unwrap();
+    for (case, name) in [
+        ("success", "implement"),
+        ("agent-error", "review"),
+        ("cleanup-failure", "review"),
+    ] {
+        let mut command = fixture.exec_without_output(case, "5");
+        command
+            .arg("--new-run-under")
+            .arg(&batch)
+            .args(["--run-name", name]);
+        bounded_output(command);
+    }
+    let mut command = fixture.base_command("success");
+    command.args(["status", "--batch"]).arg(&batch);
+    let output = bounded_output(command);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let table = String::from_utf8_lossy(&output.stdout);
+    let lines: Vec<&str> = table.lines().collect();
+    assert_eq!(lines.len(), 3, "{table}");
+    assert!(lines[0].starts_with("implement-01  completed "), "{table}");
+    assert!(lines[0].ends_with("exit 0  cleanup ok"), "{table}");
+    assert!(lines[1].starts_with("review-01     failed "), "{table}");
+    assert!(
+        lines[1].contains("exit 1  agent_error  cleanup ok  "),
+        "{table}"
+    );
+    assert!(lines[1].ends_with("fixture worker diagnostic"), "{table}");
+    assert!(lines[2].starts_with("review-02     failed "), "{table}");
+    assert!(
+        lines[2].contains("exit 3  cleanup_failed  cleanup FAILED"),
+        "{table}"
+    );
+
+    let mut command = fixture.base_command("success");
+    command
+        .args(["status", "--json", "--output-dir"])
+        .arg(batch.join("implement-01"));
+    let output = bounded_output(command);
+    assert!(output.status.success());
+    let status: Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(status["name"], "implement-01");
+    assert_eq!(status["state"], "terminal");
+    assert_eq!(status["status"], "completed");
+    assert_eq!(status["phase"], "done");
+    assert_eq!(status["last_text"], "fixture result");
+    assert!(status["idle_ms"].is_null());
+
+    let mut command = fixture.base_command("success");
+    command
+        .args(["status", "--output-dir"])
+        .arg(batch.join("prompts"));
+    let output = bounded_output(command);
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("no run.json"));
+}

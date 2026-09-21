@@ -1502,7 +1502,7 @@ fn inspect_exit(id: &str) -> Option<i32> {
     .parse()
     .ok()
 }
-fn final_assistant_text(v: &Value) -> Option<String> {
+pub(crate) fn final_assistant_text(v: &Value) -> Option<String> {
     if v.get("type")?.as_str()? != "message_end" {
         return None;
     }
@@ -1720,7 +1720,7 @@ fn create_failure(cid_file: &Path, signal: &AtomicUsize, error: anyhow::Error) -
     .into()
 }
 
-fn docker_capture_controlled(
+pub(crate) fn docker_capture_controlled(
     args: &[&str],
     deadline: Option<Instant>,
     signal: &AtomicUsize,
