@@ -59,7 +59,16 @@ pub struct RunStatus {
     pub pending_tools: usize,
     pub last_text: Option<String>,
     pub stderr_tail: Option<String>,
+    /// `result.json.error`: the classified failure, when the run stopped short.
+    pub error: Option<FailureSummary>,
     pub container: Option<ContainerState>,
+}
+
+#[derive(Debug, Serialize, Clone)]
+pub struct FailureSummary {
+    pub class: String,
+    pub message: String,
+    pub recoverable: bool,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -196,8 +205,21 @@ fn read_run_status(dir: &Path, inspect: bool) -> RunStatus {
     });
     let events = scan_events(&events_path);
     let status = field("status").and_then(|v| v.as_str().map(str::to_owned));
+    let error = field("error").and_then(|value| {
+        Some(FailureSummary {
+            class: value.get("class")?.as_str()?.to_owned(),
+            message: value.get("message")?.as_str()?.to_owned(),
+            recoverable: value
+                .get("recoverable")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+        })
+    });
     let stderr_tail = if status.as_deref().is_some_and(|s| s != "completed") {
+        // The classified error already quotes the stderr tail for worker
+        // exits and interrupted streams; do not print it twice.
         last_line(&dir.join("stderr.log"))
+            .filter(|line| error.as_ref().is_none_or(|e| e.message != *line))
     } else {
         None
     };
@@ -230,6 +252,7 @@ fn read_run_status(dir: &Path, inspect: bool) -> RunStatus {
         pending_tools: events.pending.len(),
         last_text: events.last_text,
         stderr_tail,
+        error,
         container,
     }
 }
@@ -457,6 +480,18 @@ fn describe(run: &RunStatus) -> Vec<String> {
         {
             details.push(reason.clone());
         }
+        if let Some(error) = &run.error {
+            let verdict = if error.recoverable {
+                "recoverable"
+            } else {
+                "not recoverable"
+            };
+            details.push(format!(
+                "{} ({verdict}): {}",
+                error.class,
+                truncate(&error.message, TEXT_WIDTH)
+            ));
+        }
         match run.cleanup_succeeded {
             Some(true) => details.push("cleanup ok".into()),
             Some(false) => details.push("cleanup FAILED".into()),
@@ -652,6 +687,42 @@ mod tests {
             "{table}"
         );
         assert!(runs.iter().all(|r| r.idle_ms.is_none()));
+    }
+
+    #[test]
+    fn classified_errors_replace_the_stderr_tail() {
+        let root = tempdir().unwrap();
+        let dir = root.path().join("implement-01");
+        write_run(&dir, "terminal");
+        fs::write(
+            dir.join("result.json"),
+            json!({"status":"failed","reason":"agent_error","wrapper_exit_code":1,"container_exit_code":0,"started_at_unix_ms":0,"finished_at_unix_ms":3000,"cleanup_succeeded":true,
+                "error":{"class":"provider_capacity","message":"Selected model is at capacity. Please try a different model.","recoverable":true}}).to_string(),
+        )
+        .unwrap();
+        fs::write(dir.join("stderr.log"), "context canceled\n").unwrap();
+        let run = read_run_status(&dir, false);
+        let table = render_table(std::slice::from_ref(&run));
+        assert!(
+            table.contains(
+                "agent_error  provider_capacity (recoverable): Selected model is at capacity."
+            ),
+            "{table}"
+        );
+        assert!(table.contains("context canceled"), "{table}");
+
+        let interrupted = root.path().join("implement-02");
+        write_run(&interrupted, "terminal");
+        fs::write(
+            interrupted.join("result.json"),
+            json!({"status":"failed","reason":"incomplete_event_stream","wrapper_exit_code":1,"container_exit_code":1,"started_at_unix_ms":0,"finished_at_unix_ms":3000,"cleanup_succeeded":true,
+                "error":{"class":"stream_interrupted","message":"context canceled","recoverable":true}}).to_string(),
+        )
+        .unwrap();
+        fs::write(interrupted.join("stderr.log"), "context canceled\n").unwrap();
+        let run = read_run_status(&interrupted, false);
+        assert!(run.stderr_tail.is_none());
+        assert_eq!(run.error.as_ref().unwrap().class, "stream_interrupted");
     }
 
     #[test]

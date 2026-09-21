@@ -235,15 +235,23 @@ fn final_agent_error_is_failure_even_when_process_exits_zero() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(fixture.result()["status"], "failed");
+    let result = fixture.result();
+    assert_eq!(result["status"], "failed");
+    assert_eq!(result["reason"], "agent_error");
+    assert_eq!(result["error"]["class"], "unknown");
+    assert_eq!(result["error"]["message"], "fixture model error");
+    assert_eq!(result["error"]["recoverable"], false);
     let events: Vec<Value> = String::from_utf8(output.stdout)
         .unwrap()
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(events.last().unwrap()["type"], "run_finished");
-    assert_eq!(events.last().unwrap()["status"], "failed");
-    assert_eq!(events.last().unwrap()["exit_code"], 1);
+    let finished = events.last().unwrap();
+    assert_eq!(finished["type"], "run_finished");
+    assert_eq!(finished["status"], "failed");
+    assert_eq!(finished["reason"], "agent_error");
+    assert_eq!(finished["exit_code"], 1);
+    assert_eq!(finished["error"]["message"], "fixture model error");
 }
 
 #[test]
@@ -270,7 +278,20 @@ fn recovered_agent_error_does_not_poison_final_success() {
         "{}",
         String::from_utf8_lossy(&output.stderr)
     );
-    assert_eq!(fixture.result()["status"], "completed");
+    let result = fixture.result();
+    assert_eq!(result["status"], "completed");
+    assert!(result.get("error").is_none());
+}
+
+#[test]
+fn interrupted_stream_is_classified_recoverable() {
+    let fixture = Fixture::new();
+    let output = bounded_output(fixture.command("empty-stream"));
+    assert_eq!(output.status.code(), Some(1));
+    let result = fixture.result();
+    assert_eq!(result["reason"], "incomplete_event_stream");
+    assert_eq!(result["error"]["class"], "stream_interrupted");
+    assert_eq!(result["error"]["recoverable"], true);
 }
 
 #[test]
@@ -673,7 +694,9 @@ fn status_reports_a_batch_from_real_artifacts() {
     assert!(lines[0].ends_with("exit 0  cleanup ok"), "{table}");
     assert!(lines[1].starts_with("review-01     failed "), "{table}");
     assert!(
-        lines[1].contains("exit 1  agent_error  cleanup ok  "),
+        lines[1].contains(
+            "exit 1  agent_error  unknown (not recoverable): fixture model error  cleanup ok  "
+        ),
         "{table}"
     );
     assert!(lines[1].ends_with("fixture worker diagnostic"), "{table}");

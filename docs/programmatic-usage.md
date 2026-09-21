@@ -155,6 +155,25 @@ partially written run, an RPC acknowledgment, or an available response as succes
 
 Inspect `status`, `reason`, `wrapper_exit_code`, `container_exit_code`, and
 `cleanup_succeeded` in the result. A cleanup failure is not safe to ignore.
+
+When the run stopped short because of the model, the transport, or the
+container, `result.json.error` classifies it (the same object rides on the
+`run_finished` envelope, so a controller reading stdout never has to open the
+run directory):
+
+| `reason` | `error.class` | `recoverable` |
+| --- | --- | --- |
+| `agent_error` | `provider_capacity`, `rate_limit`, `transport` | yes |
+| `agent_error` | `context_overflow`, `auth`, `aborted`, `unknown` | no |
+| `incomplete_event_stream` | `stream_interrupted` (stderr tail as message) | yes |
+| `timeout` | `timeout` | no |
+| `worker_exit` | `worker_exit` (stderr tail as message) | no |
+
+`message` is the provider's text (for example `Selected model is at capacity.
+Please try a different model.`), `provider` and `model` name what was called,
+and `diagnostics` is Pi's own array for the failed message with stack traces
+removed. `recoverable` means resuming `session_files[0]` in a fresh output
+directory is the expected next step; it says nothing about the worktree.
 Artifacts include:
 
 - `run.json`: run identity, container identity, and lifecycle metadata.
@@ -182,6 +201,7 @@ pi-sandbox status --output-dir /tmp/pi-runs/task-001 --json
 implement-01  running     14m32s  bash: cargo test --lib  idle 2m10s  last: "Added regression test for…"
 review-01     completed    6m05s  exit 0  cleanup ok
 review-02     failed       0m03s  exit 1  worker_exit  cleanup ok  warning: no saved pi credentials…
+implement-02  failed      16m45s  exit 1  agent_error  provider_capacity (recoverable): Selected model is at capacity. …  cleanup ok
 ```
 
 A running line shows the tool call still executing (or `awaiting model`

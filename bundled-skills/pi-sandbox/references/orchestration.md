@@ -168,3 +168,82 @@ A startup failure that mentions credentials or a missing API key is a namespace
 problem, not a retry candidate: check the `persistent home:` line the launcher
 printed, compare it with `pi-sandbox namespace show`, and fix the namespace
 before launching again.
+
+### Reading a failed run
+
+A worker that stops short does not hang: the launcher exits non-zero and
+writes `result.json` with `status: failed` and a `reason`. When the stop was
+the model's or the transport's doing, `result.json.error` (also on the
+`run_finished` stdout envelope and in the `status` line) says what happened
+without anyone reading `events.jsonl`:
+
+```json
+"reason": "agent_error",
+"error": {
+  "class": "provider_capacity",
+  "message": "Selected model is at capacity. Please try a different model.",
+  "recoverable": true,
+  "provider": "openai-codex", "model": "MODEL"
+}
+```
+
+`recoverable` means resuming the recorded session is the expected next step.
+It never means the worktree is untouched: resume restores the conversation,
+not files, so the worker (or you) must check `git status` first.
+
+| `error.class` | Typical message | What to do |
+| --- | --- | --- |
+| `provider_capacity` | "at capacity", "overloaded", 503/529 | Wait 30s-5m, resume the session. After repeated hits, resume with a different `--model`. |
+| `rate_limit` | 429, "rate limit", "quota" | Wait longer than the last backoff, resume. Do not add parallel workers on the same account. |
+| `transport` | "WebSocket error", ECONNRESET, 5xx | Resume promptly; Pi usually retries these itself, so one that surfaces here has already been retried. |
+| `stream_interrupted` | `context canceled`, empty stderr | The container or Docker died mid-turn (`reason: incomplete_event_stream`). Confirm Docker is healthy (`status --inspect`), then resume. |
+| `timeout` | `--timeout` elapsed | Not a retry candidate as-is: inspect what the worker was doing, then resume with a larger timeout or a narrower assignment. |
+| `context_overflow` | "maximum context length" | Do not resume; start a fresh session whose prompt summarises the state and what remains. |
+| `auth` | 401/403, "invalid API key", "token expired" | Namespace problem; fix credentials, then resume. |
+| `aborted` | Pi aborted the turn | Inspect `events.jsonl` near the end; usually a launcher-side stop. |
+| `worker_exit` | container exited non-zero | Read `stderr.log`; the worker process itself crashed. |
+| `unknown` | anything else | Read the message; treat as non-recoverable until understood. |
+
+### Resuming after a recoverable failure
+
+By hand, from the same worktree the failed run used:
+
+```text
+SESSION=$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["session_files"][0])' BATCH/implement-01/result.json)
+git -C /private/tmp/wt-implement status --porcelain      # note what the worker left behind
+pi-sandbox exec --prompt-file /private/tmp/batch-42/resume.prompt \
+  --resume-session "$SESSION" \
+  --new-run-under BATCH --run-name implement --timeout 1800 \
+  -- --provider PROVIDER --model MODEL
+```
+
+`resume.prompt` should quote the error and tell the worker to run `git status`
+and `git log` before continuing its original assignment. Bound this to two or
+three resumes per worker, and escalate to a human when the same class keeps
+recurring: a model that is at capacity for an hour is a scheduling decision,
+not a retry loop.
+
+From a controller, `run_with_recovery` in `assets/orchestrator.py` does the
+same thing: it resumes the recorded session in a fresh `NAME-NN` directory
+after each recoverable failure, with backoff, bounded attempts, an optional
+model fallback after `provider_capacity`, and a log line per decision so the
+orchestrator narrating progress sees why a worker restarted.
+
+```python
+attempts = run_with_recovery(
+    worker,
+    output_root=output_root,
+    namespace="feature_orchestrator",
+    timeout=1800,
+    pi_args=["--provider", "PROVIDER", "--model", "MODEL"],
+    max_attempts=3,
+    backoff_seconds=(30, 120, 300),
+    fallback_pi_args=["--provider", "PROVIDER", "--model", "FALLBACK_MODEL"],  # optional
+)
+outcome = attempts[-1]
+require_completed(outcome)   # raises with the classified error if it still failed
+```
+
+Non-recoverable classes end the loop immediately; the last outcome carries the
+error for the controller to report. A completed resume is still a candidate to
+review like any other run.

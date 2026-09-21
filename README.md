@@ -289,7 +289,9 @@ python3 examples/rpc_state.py --output-dir /tmp/pi-runs/review-1 --timeout 60
 
 Exec envelopes contain `schema_version`, `type`, `run_id`, and a monotonically
 increasing `seq`. `pi_event` envelopes preserve the complete upstream event in
-`event`; the terminal `run_finished` envelope includes status and exit code.
+`event`; the terminal `run_finished` envelope includes status, reason, exit
+code, and, for a run that stopped short, the same classified `error` as
+`result.json` (`class`, `message`, `recoverable`).
 RPC stdout is not wrapped. A command-acceptance RPC response is not task
 completion, and the RPC process exit status does not summarize every prompt.
 

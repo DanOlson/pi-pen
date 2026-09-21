@@ -122,6 +122,173 @@ struct ResultRecord {
     container_id: Option<String>,
     cleanup_succeeded: Option<bool>,
     session_files: Vec<PathBuf>,
+    /// Why a run stopped short, classified so a controller can pick a recovery
+    /// without reading `events.jsonl`. Absent for completed runs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<FailureInfo>,
+}
+
+/// Classification of an abnormal stop. `recoverable` means resuming the
+/// recorded session in a fresh output directory is the expected next step
+/// (after checking the worktree); it never means the failure was harmless.
+#[derive(Debug, Clone, Serialize)]
+pub struct FailureInfo {
+    pub class: String,
+    pub message: String,
+    pub recoverable: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    /// Pi's own diagnostics for the failed message, without stack traces.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub diagnostics: Vec<Value>,
+}
+
+impl FailureInfo {
+    fn simple(class: &str, message: impl Into<String>, recoverable: bool) -> Self {
+        Self {
+            class: class.into(),
+            message: message.into(),
+            recoverable,
+            provider: None,
+            model: None,
+            diagnostics: Vec::new(),
+        }
+    }
+
+    /// Build from the assistant message of a `message_end` event whose
+    /// `stopReason` is `error` or `aborted`.
+    fn from_assistant_message(message: &Value) -> Self {
+        let text = message
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .trim()
+            .to_owned();
+        let aborted = message.get("stopReason").and_then(Value::as_str) == Some("aborted");
+        let diagnostics: Vec<Value> = message
+            .get("diagnostics")
+            .and_then(Value::as_array)
+            .map(|items| items.iter().map(strip_stacks).collect())
+            .unwrap_or_default();
+        let (class, recoverable) = if aborted {
+            ("aborted", false)
+        } else {
+            classify_error_message(&text, &diagnostics)
+        };
+        Self {
+            class: class.into(),
+            message: if text.is_empty() {
+                format!(
+                    "model stopped with stopReason {}",
+                    if aborted { "aborted" } else { "error" }
+                )
+            } else {
+                text
+            },
+            recoverable,
+            provider: message
+                .get("provider")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            model: message
+                .get("model")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            diagnostics,
+        }
+    }
+}
+
+fn strip_stacks(value: &Value) -> Value {
+    match value {
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .filter(|(key, _)| key.as_str() != "stack")
+                .map(|(key, inner)| (key.clone(), strip_stacks(inner)))
+                .collect(),
+        ),
+        Value::Array(items) => Value::Array(items.iter().map(strip_stacks).collect()),
+        other => other.clone(),
+    }
+}
+
+/// Map a provider error to a coarse class. The message text is provider
+/// prose, so matching is deliberately loose; unknown errors are reported as
+/// such rather than guessed recoverable.
+fn classify_error_message(message: &str, diagnostics: &[Value]) -> (&'static str, bool) {
+    let text = message.to_ascii_lowercase();
+    let has = |needles: &[&str]| needles.iter().any(|needle| text.contains(needle));
+    if has(&[
+        "at capacity",
+        "overloaded",
+        "capacity",
+        "unavailable",
+        "503",
+        "529",
+    ]) {
+        return ("provider_capacity", true);
+    }
+    if has(&[
+        "rate limit",
+        "rate_limit",
+        "too many requests",
+        "429",
+        "quota",
+    ]) {
+        return ("rate_limit", true);
+    }
+    if has(&[
+        "context length",
+        "context window",
+        "maximum context",
+        "too many tokens",
+        "prompt is too long",
+        "input is too long",
+    ]) {
+        return ("context_overflow", false);
+    }
+    if has(&[
+        "unauthorized",
+        "authentication",
+        "invalid api key",
+        "api key",
+        "forbidden",
+        "401",
+        "403",
+        "not logged in",
+        "token expired",
+        "refresh token",
+    ]) {
+        return ("auth", false);
+    }
+    let transport_diagnostic = diagnostics.iter().any(|d| {
+        d.get("type")
+            .and_then(Value::as_str)
+            .is_some_and(|t| t.contains("transport"))
+    });
+    if transport_diagnostic
+        || has(&[
+            "websocket",
+            "econnreset",
+            "econnrefused",
+            "etimedout",
+            "socket hang up",
+            "network",
+            "fetch failed",
+            "timed out",
+            "timeout",
+            "connection",
+            "502",
+            "504",
+            "500",
+            "internal server error",
+        ])
+    {
+        return ("transport", true);
+    }
+    ("unknown", false)
 }
 
 struct FailureGuard {
@@ -176,6 +343,7 @@ impl Drop for FailureGuard {
             container_id: latest.as_ref().and_then(|r| r.container_id.clone()),
             cleanup_succeeded: None,
             session_files: session_files(&self.output.join("sessions")),
+            error: None,
         };
         let _ = write_json_atomic(&self.output.join("result.json"), &result);
     }
@@ -457,13 +625,14 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         &signal,
     );
     let cleanup = docker_remove_idempotent(&container_id);
-    let (mut status, mut reason, mut wrapper, raw, response) = match terminal {
+    let (mut status, mut reason, mut wrapper, raw, response, error) = match terminal {
         Ok(v) => v,
         Err(e) => (
             "failed".into(),
             format!("{e:#}"),
             3,
             inspect_exit(&container_id),
+            None,
             None,
         ),
     };
@@ -496,17 +665,25 @@ fn execute(options: Options, cwd: &Path, mode: Mode) -> Result<()> {
         container_id: Some(container_id.clone()),
         cleanup_succeeded: Some(cleanup),
         session_files: session_files(&output.join("sessions")),
+        error,
     };
     write_json_atomic(&output.join("result.json"), &result)?;
     failure_guard.armed = false;
     if mode == Mode::Exec
-        && let Err(error) = emit_terminal_record(&output, run_id, &status, wrapper)
+        && let Err(error) = emit_terminal_record(
+            &output,
+            run_id,
+            &status,
+            &result.reason,
+            wrapper,
+            result.error.as_ref(),
+        )
     {
         result.status = "failed".into();
         result.reason = "protocol_stdout_failed".into();
         result.wrapper_exit_code = 3;
         write_json_atomic(&output.join("result.json"), &result)?;
-        append_terminal_artifact(&output, run_id, "failed", 3)?;
+        append_terminal_artifact(&output, run_id, "failed", "protocol_stdout_failed", 3, None)?;
         return Err(ExitError {
             code: 3,
             message: format!("protocol stdout failed: {error:#}"),
@@ -542,7 +719,14 @@ fn parse_pi_version(output: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
-type Terminal = (String, String, i32, Option<i32>, Option<String>);
+type Terminal = (
+    String,
+    String,
+    i32,
+    Option<i32>,
+    Option<String>,
+    Option<FailureInfo>,
+);
 
 type WriteAck = mpsc::Sender<std::result::Result<(), String>>;
 struct ProtocolWriter {
@@ -718,7 +902,7 @@ fn supervise(
     let mut seq = 0u64;
     let mut response = None;
     let mut saw_agent_end = false;
-    let mut unrecovered_error = false;
+    let mut last_error: Option<FailureInfo> = None;
     let mut protocol_error = None;
     let mut rpc_eof = None;
     let mut events = OpenOptions::new()
@@ -751,6 +935,7 @@ fn supervise(
                 signal_code as i32,
                 status.code(),
                 response,
+                None,
             ));
         }
         if mode == Mode::Rpc && rpc_eof.is_none() && eof_rx.try_recv().is_ok() {
@@ -779,6 +964,11 @@ fn supervise(
                 124,
                 inspect_exit(id),
                 response,
+                Some(FailureInfo::simple(
+                    "timeout",
+                    "run exceeded --timeout before the agent finished",
+                    false,
+                )),
             ));
         }
         match rx.recv_timeout(Duration::from_millis(100)) {
@@ -818,11 +1008,13 @@ fn supervise(
                             .and_then(Value::as_str)
                             == Some("assistant")
                     {
-                        unrecovered_error = event
-                            .get("message")
-                            .and_then(|m| m.get("stopReason"))
+                        let message = &event["message"];
+                        let stopped_abnormally = message
+                            .get("stopReason")
                             .and_then(Value::as_str)
                             .is_some_and(|r| matches!(r, "error" | "aborted"));
+                        last_error = stopped_abnormally
+                            .then(|| FailureInfo::from_assistant_message(message));
                     }
                     if let Some(text) = final_assistant_text(&event) {
                         response = Some(text);
@@ -859,23 +1051,36 @@ fn supervise(
             130,
             status.code(),
             response,
+            None,
         ));
     }
     if let Some(error) = protocol_error {
-        return Ok(("failed".into(), error, 1, status.code(), response));
+        return Ok(("failed".into(), error, 1, status.code(), response, None));
     }
-    let terminal = if mode == Mode::Exec && (!saw_agent_end || unrecovered_error) {
+    let terminal = if mode == Mode::Exec && (!saw_agent_end || last_error.is_some()) {
+        let (reason, error) = match last_error {
+            Some(error) => ("agent_error", error),
+            // The stream ended without `agent_end`: the container or its
+            // transport died mid-turn (`docker` reports e.g. `context
+            // canceled`), so the session file is intact up to the last
+            // completed message.
+            None => (
+                "incomplete_event_stream",
+                FailureInfo::simple(
+                    "stream_interrupted",
+                    last_stderr_line(output)
+                        .unwrap_or_else(|| "event stream ended before agent_end".into()),
+                    true,
+                ),
+            ),
+        };
         (
             "failed".into(),
-            if unrecovered_error {
-                "agent_error"
-            } else {
-                "incomplete_event_stream"
-            }
-            .into(),
+            reason.into(),
             1,
             status.code(),
             response,
+            Some(error),
         )
     } else if mode == Mode::Rpc && rpc_eof.is_some() {
         (
@@ -884,9 +1089,10 @@ fn supervise(
             0,
             status.code(),
             response,
+            None,
         )
     } else {
-        outcome(status, mode, response)?
+        outcome(status, mode, response, last_stderr_line(output))?
     };
     Ok(terminal)
 }
@@ -917,8 +1123,15 @@ fn read_bounded_record(reader: &mut impl BufRead) -> Result<Option<Vec<u8>>> {
     }
 }
 
-fn emit_terminal_record(output: &Path, run_id: Uuid, status: &str, exit_code: i32) -> Result<()> {
-    let envelope = terminal_envelope(output, run_id, status, exit_code)?;
+fn emit_terminal_record(
+    output: &Path,
+    run_id: Uuid,
+    status: &str,
+    reason: &str,
+    exit_code: i32,
+    error: Option<&FailureInfo>,
+) -> Result<()> {
+    let envelope = terminal_envelope(output, run_id, status, reason, exit_code, error)?;
     ProtocolWriter::new().send_json(&envelope)?;
     append_json_event(output, &envelope)
 }
@@ -927,20 +1140,34 @@ fn append_terminal_artifact(
     output: &Path,
     run_id: Uuid,
     status: &str,
+    reason: &str,
     exit_code: i32,
+    error: Option<&FailureInfo>,
 ) -> Result<()> {
-    let envelope = terminal_envelope(output, run_id, status, exit_code)?;
+    let envelope = terminal_envelope(output, run_id, status, reason, exit_code, error)?;
     append_json_event(output, &envelope)
 }
 
-fn terminal_envelope(output: &Path, run_id: Uuid, status: &str, exit_code: i32) -> Result<Value> {
+/// The `run_finished` envelope carries the same `reason` and `error` as
+/// `result.json`, so a controller reading stdout can decide on recovery
+/// without opening the run directory.
+fn terminal_envelope(
+    output: &Path,
+    run_id: Uuid,
+    status: &str,
+    reason: &str,
+    exit_code: i32,
+    error: Option<&FailureInfo>,
+) -> Result<Value> {
     let path = output.join("events.jsonl");
     let seq = File::open(&path)
         .map(|file| BufReader::new(file).lines().count() as u64 + 1)
         .unwrap_or(1);
-    Ok(
-        json!({"schema_version":SCHEMA_VERSION,"type":"run_finished","run_id":run_id,"seq":seq,"status":status,"exit_code":exit_code}),
-    )
+    let mut envelope = json!({"schema_version":SCHEMA_VERSION,"type":"run_finished","run_id":run_id,"seq":seq,"status":status,"reason":reason,"exit_code":exit_code});
+    if let Some(error) = error {
+        envelope["error"] = serde_json::to_value(error)?;
+    }
+    Ok(envelope)
 }
 
 fn append_json_event(output: &Path, envelope: &Value) -> Result<()> {
@@ -950,7 +1177,12 @@ fn append_json_event(output: &Path, envelope: &Value) -> Result<()> {
     write_json_line(&mut events, envelope)
 }
 
-fn outcome(status: ExitStatus, mode: Mode, response: Option<String>) -> Result<Terminal> {
+fn outcome(
+    status: ExitStatus,
+    mode: Mode,
+    response: Option<String>,
+    stderr_tail: Option<String>,
+) -> Result<Terminal> {
     if status.success() {
         Ok((
             "completed".into(),
@@ -963,6 +1195,7 @@ fn outcome(status: ExitStatus, mode: Mode, response: Option<String>) -> Result<T
             0,
             status.code(),
             response,
+            None,
         ))
     } else {
         Ok((
@@ -971,8 +1204,25 @@ fn outcome(status: ExitStatus, mode: Mode, response: Option<String>) -> Result<T
             1,
             status.code(),
             response,
+            Some(FailureInfo::simple(
+                "worker_exit",
+                stderr_tail.unwrap_or_else(|| {
+                    format!("worker exited with status {}", status.code().unwrap_or(-1))
+                }),
+                false,
+            )),
         ))
     }
+}
+
+/// Last non-empty line of `stderr.log`, for a one-line failure summary.
+fn last_stderr_line(output: &Path) -> Option<String> {
+    let text = fs::read_to_string(output.join("stderr.log")).ok()?;
+    text.lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .map(|line| line.chars().take(400).collect())
 }
 
 struct CreateSpec<'a> {
@@ -1918,6 +2168,71 @@ fn canonicalize_prospective(path: &Path) -> Result<PathBuf> {
 mod tests {
     use super::*;
     use tempfile::tempdir;
+    #[test]
+    fn classifies_provider_errors() {
+        let capacity = FailureInfo::from_assistant_message(&json!({
+            "role":"assistant","stopReason":"error",
+            "errorMessage":"Selected model is at capacity. Please try a different model.",
+            "provider":"openai-codex","model":"gpt-5.6-sol"
+        }));
+        assert_eq!(capacity.class, "provider_capacity");
+        assert!(capacity.recoverable);
+        assert_eq!(capacity.provider.as_deref(), Some("openai-codex"));
+
+        let transport = FailureInfo::from_assistant_message(&json!({
+            "role":"assistant","stopReason":"error","errorMessage":"WebSocket error",
+            "diagnostics":[{"type":"provider_transport_failure","error":{"message":"WebSocket error","stack":"Error: ...\n at x"}}]
+        }));
+        assert_eq!(transport.class, "transport");
+        assert!(transport.recoverable);
+        assert!(transport.diagnostics[0]["error"].get("stack").is_none());
+
+        let auth = FailureInfo::from_assistant_message(&json!({
+            "role":"assistant","stopReason":"error","errorMessage":"401 Unauthorized: invalid API key"
+        }));
+        assert_eq!(auth.class, "auth");
+        assert!(!auth.recoverable);
+
+        let overflow = FailureInfo::from_assistant_message(&json!({
+            "role":"assistant","stopReason":"error","errorMessage":"This model's maximum context length is 200000 tokens"
+        }));
+        assert_eq!(overflow.class, "context_overflow");
+        assert!(!overflow.recoverable);
+
+        let aborted = FailureInfo::from_assistant_message(&json!({
+            "role":"assistant","stopReason":"aborted"
+        }));
+        assert_eq!(aborted.class, "aborted");
+        assert_eq!(aborted.message, "model stopped with stopReason aborted");
+
+        let unknown = FailureInfo::from_assistant_message(&json!({
+            "role":"assistant","stopReason":"error","errorMessage":"something odd"
+        }));
+        assert_eq!(unknown.class, "unknown");
+        assert!(!unknown.recoverable);
+    }
+
+    #[test]
+    fn terminal_envelope_carries_reason_and_error() {
+        let dir = tempdir().unwrap();
+        let error = FailureInfo::simple("stream_interrupted", "context canceled", true);
+        let envelope = terminal_envelope(
+            dir.path(),
+            Uuid::nil(),
+            "failed",
+            "incomplete_event_stream",
+            1,
+            Some(&error),
+        )
+        .unwrap();
+        assert_eq!(envelope["reason"], "incomplete_event_stream");
+        assert_eq!(envelope["error"]["class"], "stream_interrupted");
+        assert_eq!(envelope["error"]["recoverable"], true);
+        let plain = terminal_envelope(dir.path(), Uuid::nil(), "completed", "normal_exit", 0, None)
+            .unwrap();
+        assert!(plain.get("error").is_none());
+    }
+
     #[test]
     fn rejects_managed_and_unknown_pi_args() {
         assert!(validate_pi_args(&["--mode=json".into()]).is_err());

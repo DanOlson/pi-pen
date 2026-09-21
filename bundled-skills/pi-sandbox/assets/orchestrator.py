@@ -18,7 +18,8 @@ import signal
 import shutil
 import subprocess
 import sys
-from typing import Iterable, Mapping, Sequence
+import time
+from typing import Callable, Iterable, Mapping, Sequence
 
 
 @dataclass(frozen=True)
@@ -41,6 +42,34 @@ class Outcome:
     @property
     def completed(self) -> bool:
         return self.exit_code == 0 and self.status == "completed"
+
+    @property
+    def error(self) -> dict | None:
+        """``result.json.error``: class, message, recoverable; None when absent."""
+        error = self.result.get("error")
+        return error if isinstance(error, dict) else None
+
+    @property
+    def recoverable(self) -> bool:
+        """True when resuming the recorded session is the expected next step.
+
+        The launcher sets this for transient provider failures (capacity,
+        rate limits, transport) and for a stream that died mid-turn. It says
+        nothing about the worktree: resume restores the conversation only.
+        """
+        error = self.error
+        return bool(error and error.get("recoverable")) and len(
+            self.result.get("session_files") or []
+        ) == 1
+
+    def describe_failure(self) -> str:
+        error = self.error
+        if error is None:
+            return f"exit={self.exit_code} status={self.status}"
+        return (
+            f"exit={self.exit_code} status={self.status} "
+            f"{error.get('class')}: {error.get('message')}"
+        )
 
 
 _active: set[subprocess.Popen] = set()
@@ -232,10 +261,100 @@ def session_file(outcome: Outcome) -> Path:
     return Path(sessions[0]).resolve(strict=True)
 
 
+RECOVERY_PROMPT = """\
+Your previous run stopped before you finished, for a reason outside your control:
+{error_class}: {error_message}
+
+This is the same conversation, resumed. The worktree is in whatever state you left
+it, including any uncommitted edits. Before doing anything else, run `git status`
+and `git log -3 --oneline` and compare them with your own last steps; then continue
+the original assignment to completion and report as originally instructed.
+"""
+
+
+def run_with_recovery(
+    worker: Worker,
+    *,
+    max_attempts: int = 3,
+    backoff_seconds: Sequence[float] = (30, 120, 300),
+    fallback_pi_args: Sequence[str] | None = None,
+    recovery_prompt: str = RECOVERY_PROMPT,
+    log: Callable[[str], None] | None = None,
+    **kwargs,
+) -> list[Outcome]:
+    """Run a worker and resume its session after recoverable failures.
+
+    Returns every attempt's outcome, oldest first; the last one is the final
+    state. A retry only happens when the launcher classified the failure as
+    recoverable (a transient provider or transport error, or a stream that
+    died mid-turn) and recorded exactly one session file. Each retry waits
+    the next ``backoff_seconds`` entry (the last entry repeats), then resumes
+    that session in a fresh ``<name>-NN`` directory with ``recovery_prompt``
+    prepended so the worker re-checks the worktree first.
+
+    ``fallback_pi_args`` replaces ``pi_args`` for the retry after a
+    ``provider_capacity`` failure, for example to switch model. It is off by
+    default because a model swap mid-task is a judgment call.
+
+    Anything else (``auth``, ``context_overflow``, ``unknown``, a completed
+    run, an interrupt) ends the loop; reconcile from the last outcome.
+    """
+    if max_attempts < 1:
+        raise ValueError("max_attempts must be at least 1")
+    if not backoff_seconds:
+        raise ValueError("backoff_seconds must not be empty")
+    log = log or (lambda text: print(text, file=sys.stderr, flush=True))
+    pi_args = list(kwargs.pop("pi_args", ()))
+    attempts: list[Outcome] = []
+    current = worker
+    for attempt in range(1, max_attempts + 1):
+        outcome = run_worker(current, pi_args=pi_args, **kwargs)
+        attempts.append(outcome)
+        if outcome.completed or _interrupted is not None:
+            break
+        if not outcome.recoverable:
+            log(f"{worker.name}: not recoverable ({outcome.describe_failure()}); "
+                f"inspect {outcome.output_dir}")
+            break
+        if attempt == max_attempts:
+            log(f"{worker.name}: giving up after {attempt} attempts "
+                f"({outcome.describe_failure()}); inspect {outcome.output_dir}")
+            break
+        error = outcome.error or {}
+        if fallback_pi_args is not None and error.get("class") == "provider_capacity":
+            pi_args = list(fallback_pi_args)
+            log(f"{worker.name}: switching to fallback pi args for the next attempt")
+        delay = backoff_seconds[min(attempt - 1, len(backoff_seconds) - 1)]
+        log(f"{worker.name}: attempt {attempt}/{max_attempts} stopped "
+            f"({outcome.describe_failure()}); resuming in {delay:g}s")
+        if not _interruptible_sleep(delay):
+            break
+        current = Worker(
+            worker.name,
+            worker.worktree,
+            recovery_prompt.format(
+                error_class=error.get("class", "unknown"),
+                error_message=error.get("message", ""),
+            ),
+            resume_session=session_file(outcome),
+        )
+    return attempts
+
+
+def _interruptible_sleep(seconds: float) -> bool:
+    """Sleep in short steps; return False if an interrupt arrived."""
+    deadline = time.monotonic() + seconds
+    while time.monotonic() < deadline:
+        if _interrupted is not None:
+            return False
+        time.sleep(min(0.5, max(0.0, deadline - time.monotonic())))
+    return _interrupted is None
+
+
 def require_completed(outcome: Outcome) -> None:
     if not outcome.completed:
         raise RuntimeError(
-            f"{outcome.name} failed: exit={outcome.exit_code} status={outcome.status}; "
+            f"{outcome.name} failed: {outcome.describe_failure()}; "
             f"inspect {outcome.output_dir}"
         )
 

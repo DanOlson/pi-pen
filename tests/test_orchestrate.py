@@ -33,9 +33,21 @@ if args[1] == 'rpc':
 prompt = pathlib.Path(args[args.index('--prompt-file') + 1]).read_text()
 if prompt == 'missing':
     sys.exit(2)
-def finish(code, status):
-    (out / 'result.json').write_text(json.dumps({'status':status}))
+def finish(code, status, **extra):
+    (out / 'result.json').write_text(json.dumps({'status':status, **extra}))
     sys.exit(code)
+if prompt.startswith('capacity'):
+    # A transient provider failure: the launcher records the classified error
+    # and the session file that a resume would continue from.
+    (out / 'sessions').mkdir()
+    session = out / 'sessions' / 'session.jsonl'
+    session.write_text('{}\\n')
+    finish(1, 'failed', reason='agent_error', session_files=[str(session)],
+           error={'class':'provider_capacity','recoverable':True,
+                  'message':'Selected model is at capacity. Please try a different model.'})
+if prompt == 'auth':
+    finish(1, 'failed', reason='agent_error', session_files=[],
+           error={'class':'auth','recoverable':False,'message':'401 Unauthorized'})
 signal.signal(signal.SIGTERM, lambda *args: finish(143, 'cancelled'))
 (out / 'started').write_text(str(pathlib.Path.cwd()))
 if prompt == 'slow':
@@ -175,6 +187,50 @@ class ExamplesTest(unittest.TestCase):
         self.assertEqual(retry.output_dir, self.root / 'skill-run/skill-worker-02')
         self.assertTrue((self.root / 'skill-run/skill-worker-02.prompt.txt').is_file())
         self.assertTrue((self.root / 'skill-run/skill-worker-01/args.json').is_file())
+
+
+    def test_run_with_recovery_resumes_recoverable_failures(self):
+        # Prompt "capacity" fails; the resumed prompt (the recovery text) succeeds.
+        logs = []
+        attempts = SKILL_RUNNER.run_with_recovery(
+            SKILL_RUNNER.Worker('flaky', self.worktrees[0], 'capacity'),
+            output_root=self.root / 'recover', binary=str(self.binary), timeout=10,
+            backoff_seconds=(0,), max_attempts=3, log=logs.append,
+            pi_args=['--model', 'primary'], fallback_pi_args=['--model', 'backup'])
+        self.assertEqual([a.status for a in attempts], ['failed', 'completed'])
+        first, second = attempts
+        self.assertEqual(first.error['class'], 'provider_capacity')
+        self.assertTrue(first.recoverable)
+        self.assertEqual(second.output_dir, self.root / 'recover/flaky-02')
+        args = json.loads((second.output_dir / 'args.json').read_text())
+        self.assertEqual(args[args.index('--resume-session') + 1],
+                         str(first.output_dir / 'sessions/session.jsonl'))
+        self.assertEqual(args[args.index('--model') + 1], 'backup')
+        resumed_prompt = (self.root / 'recover/flaky-02.prompt.txt').read_text()
+        self.assertIn('provider_capacity: Selected model is at capacity', resumed_prompt)
+        self.assertIn('git status', resumed_prompt)
+        self.assertTrue(any('resuming in 0s' in line for line in logs), logs)
+
+    def test_run_with_recovery_stops_on_unrecoverable_and_bounded_attempts(self):
+        attempts = SKILL_RUNNER.run_with_recovery(
+            SKILL_RUNNER.Worker('locked', self.worktrees[0], 'auth'),
+            output_root=self.root / 'recover', binary=str(self.binary), timeout=10,
+            backoff_seconds=(0,), log=lambda _: None)
+        self.assertEqual(len(attempts), 1)
+        self.assertFalse(attempts[0].recoverable)
+        with self.assertRaisesRegex(RuntimeError, 'auth: 401 Unauthorized'):
+            SKILL_RUNNER.require_completed(attempts[0])
+
+        # Every attempt fails the same way: bounded by max_attempts. The fake
+        # keeps failing because the resumed prompt is rewritten to start with
+        # "capacity" below.
+        attempts = SKILL_RUNNER.run_with_recovery(
+            SKILL_RUNNER.Worker('down', self.worktrees[1], 'capacity'),
+            output_root=self.root / 'recover', binary=str(self.binary), timeout=10,
+            backoff_seconds=(0,), max_attempts=2, log=lambda _: None,
+            recovery_prompt='capacity again: {error_class} {error_message}')
+        self.assertEqual([a.status for a in attempts], ['failed', 'failed'])
+        self.assertEqual(attempts[1].output_dir, self.root / 'recover/down-02')
 
 
 if __name__ == '__main__':
