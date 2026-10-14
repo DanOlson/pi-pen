@@ -3,6 +3,9 @@
 `pi-sandbox` launches the `pi` coding agent inside a Docker development
 environment while mounting the current project as a writable `/workspace`.
 
+>[!NOTE]
+> This is not affiliated with the [Pi project](https://pi.dev/)
+
 ## Install From Source
 
 Prerequisites:
