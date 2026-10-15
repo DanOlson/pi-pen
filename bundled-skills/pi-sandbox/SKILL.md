@@ -29,7 +29,9 @@ must use one explicit namespace. Check before anything else:
 pi-sandbox namespace show
 ```
 
-If it reports `worktree default` or `no pi credentials`:
+If it reports `worktree default`, or `no pi credentials` for a provider that
+authenticates through pi (see [Cloud provider credentials](#cloud-provider-credentials)
+for providers that do not):
 
 1. Declare the namespace in the repository manifest so every `run`, `exec`, and
    `rpc` in any linked worktree inherits it without a flag. For a new manifest,
@@ -62,6 +64,37 @@ Every headless launch prints the resolved home and its credential state to
 stderr, and `run.json` records `namespace`, `worktree_id`, and
 `persistent_home`. When a worker fails at startup, read that line before
 changing anything else.
+
+### Cloud provider credentials
+
+Some providers, such as `amazon-bedrock`, do not use pi's login at all: the
+provider's SDK reads its own credentials. For Bedrock these are `AWS_*`
+launch variables (for example `AWS_PROFILE` and `AWS_REGION` in `[run.env]`)
+plus AWS config and SSO token files that the human copies into the namespace
+home under `.aws/`. Copying those AWS files by hand is the intended setup; the
+rule against copying auth files applies to pi's own credentials.
+
+`namespace show` only checks for pi's own credentials, so for these providers
+it reports `no pi credentials` and every launch prints the
+`no saved pi credentials` warning even when the setup is correct. Do not ask
+the human to log in because of either. Confirm the setup instead:
+
+- `pi-sandbox exec --dry-run ...` lists the expected `AWS_*` keys among the
+  launch environment.
+- The home reported by `namespace show` contains `.aws/config` and
+  `.aws/sso/cache/`.
+- A short smoke-test prompt with
+  `-- --provider amazon-bedrock --model MODEL` finishes with status
+  `completed`.
+
+If a Bedrock worker fails with `ExpiredTokenException` or a message saying the
+security token is expired, the SSO session has lapsed. Treat it as
+`fix_environment` even if the classifier did not: do not retry or resume. Ask
+the human to log in again and recopy the AWS files.
+
+Choose the fallback model pair within the same provider, as for any other
+provider; the `openai-codex` pair in the orchestration reference does not
+apply. Use the pair the human names, or ask for one.
 
 ## Launcher commands at a glance
 

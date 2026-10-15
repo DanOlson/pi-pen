@@ -104,6 +104,8 @@ Each headless launch prints `persistent home: <path> (namespace <name>, ...)`
 to stderr before starting Docker, and `run.json` records `namespace`,
 `worktree_id`, and `persistent_home`. A warning on that line means the home
 has no saved credentials and no `*_API_KEY` launch variable was supplied.
+Providers that read their own SDK credentials, such as `amazon-bedrock` with
+AWS SSO, always trigger it; see "Cloud provider credentials" in `SKILL.md`.
 
 ## Completion
 

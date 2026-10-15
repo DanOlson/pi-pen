@@ -231,7 +231,9 @@ Pick the pair so that a swap changes nothing except the model:
 - The fallback is the nearest sibling that is good enough to *finish* the
   assignment, not merely to answer; a reviewer still judges the result.
 - Lead with the stronger model. The pair for `openai-codex` workers is
-  `gpt-5.6-sol` primary and `gpt-5.5` fallback.
+  `gpt-5.6-sol` primary and `gpt-5.5` fallback. For any other provider,
+  such as `amazon-bedrock`, use the pair the human names within that
+  provider.
 
 Say which model each attempt ran on when reporting: `run_with_recovery` logs
 `swapping to PROVIDER/MODEL` at every swap, and each attempt's
