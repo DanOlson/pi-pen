@@ -260,12 +260,12 @@ lean image that only installs packages listed in the manifest.
 Every generated image installs `pi` with:
 
 ```dockerfile
-RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1
+RUN npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.5.2
 ```
 
 Override that command with `pi_install` only when testing a different agent
 package or install source. Headless option and basic framing behavior has been
-checked against 0.85.1; a custom install may use incompatible JSON/RPC records
+checked against 1.5.2; a custom install may use incompatible JSON/RPC records
 or options.
 
 ## Programmatic workers

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Deterministic real-pi protocol check with no paid credentials.
 
-Run on Docker Desktop after building/pulling an image containing pinned pi 0.85.1:
+Run on Docker Desktop after building/pulling an image containing pinned pi 1.5.2:
 
     PI_REAL_IMAGE=pi-sandbox-env:50ff6cf9183b3133 python3 tests/real_pi_compat.py
 
@@ -79,14 +79,14 @@ def assert_successful_turn(events: list[dict], prompt: str) -> None:
 def main() -> None:
     image = os.environ.get("PI_REAL_IMAGE")
     if not image:
-        raise SystemExit("set PI_REAL_IMAGE to an image containing pi 0.85.1")
+        raise SystemExit("set PI_REAL_IMAGE to an image containing pi 1.5.2")
     version = subprocess.run(
         ["docker", "run", "--rm", image, "pi", "--version"],
         check=True,
         capture_output=True,
         text=True,
     ).stdout.strip()
-    assert version == "0.85.1", version
+    assert version == "1.5.2", version
 
     server = ThreadingHTTPServer(("0.0.0.0", 0), MockModelHandler)
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -168,7 +168,7 @@ def main() -> None:
             assert rpc.wait(timeout=10) == 0
             response_ids = {event.get("id") for event in rpc_events if event.get("type") == "response"}
             assert {"prompt-1", "prompt-2"} <= response_ids
-            print("real pi 0.85.1 print/resume/two-prompt RPC compatibility: PASS")
+            print("real pi 1.5.2 print/resume/two-prompt RPC compatibility: PASS")
     finally:
         server.shutdown()
         server.server_close()

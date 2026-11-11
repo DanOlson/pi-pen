@@ -20,7 +20,7 @@ pub use launch::{
 const PROJECT_MANIFEST: &str = ".pi-env.toml";
 const DEFAULT_BASE_IMAGE: &str = "node:22-bookworm";
 const DEFAULT_PI_INSTALL: &str =
-    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1";
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.5.2";
 
 pub mod headless;
 pub mod skills;

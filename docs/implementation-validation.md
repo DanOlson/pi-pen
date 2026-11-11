@@ -51,7 +51,7 @@ exit; both preserve the correct cleanup and exit-status contract.
 
 ## Actual pi protocol compatibility
 
-`tests/real_pi_compat.py` runs actual pi 0.85.1 against a local deterministic
+`tests/real_pi_compat.py` runs actual pi 1.5.2 against a local deterministic
 OpenAI-compatible test server. It verifies successful print/JSON operation,
 explicit session resumption, two sequential RPC prompts, and orderly EOF.
 No external model credentials or paid inference are used.
@@ -63,7 +63,7 @@ PI_REAL_IMAGE=pi-sandbox-env:50ff6cf9183b3133 python3 tests/real_pi_compat.py
 ```
 
 The image tag above is the image used on this workstation; substitute another
-image containing pi 0.85.1 elsewhere. The fixture verifies the actual version,
+image containing pi 1.5.2 elsewhere. The fixture verifies the actual version,
 uses an ephemeral local port and temporary session state, and cleans them up.
 Basic missing-credential behavior was also checked against the actual package.
 

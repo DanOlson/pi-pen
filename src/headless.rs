@@ -21,7 +21,7 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use uuid::Uuid;
 
-pub const PI_VERSION: &str = "0.85.1";
+pub const PI_VERSION: &str = "1.5.2";
 pub const SCHEMA_VERSION: u32 = 1;
 const MAX_PROMPT: u64 = 8 * 1024 * 1024;
 const MAX_RECORD: usize = 32 * 1024 * 1024;
