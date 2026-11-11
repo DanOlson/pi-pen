@@ -113,7 +113,7 @@ pi-sandbox init --yes
 Common overrides:
 
 ```sh
-pi-sandbox init --yes --name my-env --base-image node:24-bookworm
+pi-sandbox init --yes --name my-env --base-image node:24-trixie
 pi-sandbox init --yes --extends rust-node
 pi-sandbox init --yes --with rust,node
 pi-sandbox init --yes --with rails
@@ -128,9 +128,10 @@ Stack presets expand into plain manifest content:
 
 - `node`: use the default Node LTS base image.
 - `python`: add Python runtime packages and install pinned uv/uvx binaries.
-- `rails`: use Ruby 4.0.1 on Bookworm, copy Node 24 from the official Node
-  image for `pi` and asset tooling, add PostgreSQL, SQLite, and libvips
-  dependencies, and persist installed bundle gems in the project home.
+- `rails`: use the latest Ruby 4.0 patch on Debian Trixie, copy Node 24 from
+  the official Node image for `pi` and asset tooling, add PostgreSQL, SQLite,
+  and libvips dependencies, and persist installed bundle gems in the project
+  home.
 - `rust`: install Rust under `/opt/cargo` and `/opt/rustup`, add `rustfmt`
   and `clippy`, set runtime Cargo/Rust environment, and point
   `CARGO_TARGET_DIR` at `/tmp/pi-home/.cache/cargo-target` so every worker in
@@ -168,7 +169,7 @@ Resolution order:
 2. Repo-local `.pi-env.toml`.
 3. User-library manifest at the platform config directory:
    `pi-sandbox/envs/<name>.toml`.
-4. Built-in default environment based on `node:24-bookworm` plus a practical
+4. Built-in default environment based on `node:24-trixie` plus a practical
    Debian package baseline.
 
 ## Reusing Images
@@ -207,7 +208,7 @@ the same manifest.
 
 ```toml
 name = "rust-node"
-base_image = "node:24-bookworm"
+base_image = "node:24-trixie"
 packages = ["ripgrep"]
 commands = [
   "npm --version"
@@ -228,7 +229,7 @@ prepend = "# syntax=docker/dockerfile:1"
 append = "RUN true"
 ```
 
-The default base image is `node:24-bookworm`. By default, every environment
+The default base image is `node:24-trixie`. By default, every environment
 also installs these convenience packages:
 
 ```toml

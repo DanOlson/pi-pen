@@ -745,7 +745,7 @@ mod tests {
         fs::write(
             dir.path().join("parent/base.toml"),
             r#"
-base_image = "node:24-bookworm"
+base_image = "node:24-trixie"
 [run]
 networks = ["one", "one", "two"]
 env_files = ["base.env"]
