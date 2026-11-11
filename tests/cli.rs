@@ -329,7 +329,7 @@ fn env_show_renders_builtin_default() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("FROM node:22-bookworm"));
+    assert!(stdout.contains("FROM node:24-trixie"));
     assert!(stdout.contains("npm install -g --ignore-scripts @earendil-works/pi-coding-agent"));
 }
 
@@ -382,7 +382,7 @@ fn env_show_renders_an_inherited_image_chain() {
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
     assert_eq!(stdout.matches("# image pi-sandbox-env:").count(), 2);
-    assert!(stdout.contains("FROM node:22-bookworm"));
+    assert!(stdout.contains("FROM node:24-trixie"));
     assert!(stdout.contains("FROM pi-sandbox-env:"));
     assert!(stdout.contains("ripgrep"));
     assert!(stdout.contains("fd-find"));
@@ -399,7 +399,7 @@ fn env_list_includes_builtin() {
 
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("built-in\tdefault\tnode:22-bookworm"));
+    assert!(stdout.contains("built-in\tdefault\tnode:24-trixie"));
 }
 
 #[test]
@@ -413,7 +413,7 @@ fn init_yes_writes_default_manifest() {
 
     assert!(output.status.success());
     let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
-    assert!(manifest.contains("base_image = \"node:22-bookworm\""));
+    assert!(manifest.contains("base_image = \"node:24-trixie\""));
     assert!(manifest.contains("name = "));
     assert!(!manifest.contains("default_packages"));
 }
@@ -534,8 +534,8 @@ fn init_with_rails_writes_pinned_ruby_node_manifest() {
     assert!(output.status.success());
     let manifest = fs::read_to_string(dir.path().join(".pi-env.toml")).unwrap();
     assert!(manifest.contains("base_image = \"rails-ruby-node\""));
-    assert!(manifest.contains("ruby:4.0.1-bookworm"));
-    assert!(manifest.contains("node:22-bookworm"));
+    assert!(manifest.contains("ruby:4.0-trixie"));
+    assert!(manifest.contains("node:24-trixie"));
     assert!(manifest.contains("libpq-dev"));
     assert!(manifest.contains("libvips"));
     assert!(manifest.contains("BUNDLE_PATH = \"/tmp/pi-home/bundle\""));

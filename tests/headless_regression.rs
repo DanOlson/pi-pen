@@ -41,7 +41,7 @@ case "$1" in
   info) printf 'fixture-daemon-id\n' ;;
   network)
     if [ "$TEST_CASE" = missing-network ]; then exit 1; fi ;;
-  run) printf '0.85.1\n' ;;
+  run) printf '1.5.2\n' ;;
   create)
     cidfile=''
     previous=''

@@ -18,9 +18,9 @@ pub use launch::{
 };
 
 const PROJECT_MANIFEST: &str = ".pi-env.toml";
-const DEFAULT_BASE_IMAGE: &str = "node:22-bookworm";
+const DEFAULT_BASE_IMAGE: &str = "node:24-trixie";
 const DEFAULT_PI_INSTALL: &str =
-    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@0.85.1";
+    "npm install -g --ignore-scripts @earendil-works/pi-coding-agent@1.5.2";
 
 pub mod headless;
 pub mod skills;
@@ -56,7 +56,7 @@ const UV_VERSION: &str = "0.12.0";
 /// Shared build cache inside the persistent home so linked worktrees using one
 /// namespace reuse a single compiled graph instead of rebuilding per worktree.
 const RUST_TARGET_DIR: &str = "/tmp/pi-home/.cache/cargo-target";
-const RAILS_RUBY_IMAGE: &str = "ruby:4.0.1-bookworm";
+const RAILS_RUBY_IMAGE: &str = "ruby:4.0-trixie";
 const RAILS_BASE_STAGE: &str = "rails-ruby-node";
 const RAILS_NODE_STAGE: &str = "pi-node-runtime";
 const RAILS_BUNDLE_PATH: &str = "/tmp/pi-home/bundle";
@@ -1821,7 +1821,7 @@ mod tests {
     fn renders_default_dockerfile_with_pi_install() {
         let dockerfile = render_dockerfile(&EnvManifest::default());
 
-        assert!(dockerfile.contains("FROM node:22-bookworm"));
+        assert!(dockerfile.contains("FROM node:24-trixie"));
         assert!(dockerfile.contains(DEFAULT_PI_INSTALL));
         assert!(dockerfile.contains("/tmp/pi-home"));
     }
@@ -1831,7 +1831,7 @@ mod tests {
         let manifest = EnvManifest {
             name: Some("rust".to_string()),
             extends: None,
-            base_image: Some("node:22-bookworm".to_string()),
+            base_image: Some("node:24-trixie".to_string()),
             default_packages: Some(false),
             packages: vec!["git".to_string(), "curl".to_string()],
             env: BTreeMap::from([("RUSTUP_HOME".to_string(), "/opt/rustup".to_string())]),
@@ -1850,7 +1850,7 @@ mod tests {
 
         let dockerfile = render_dockerfile(&manifest);
 
-        assert!(dockerfile.starts_with("# syntax=docker/dockerfile:1\nFROM node:22-bookworm"));
+        assert!(dockerfile.starts_with("# syntax=docker/dockerfile:1\nFROM node:24-trixie"));
         assert!(
             dockerfile.contains(
                 "RUN apt-get update && apt-get install -y --no-install-recommends git curl"
@@ -2612,7 +2612,7 @@ mod tests {
             dir.path().join("base.toml"),
             r#"
 name = "rust"
-base_image = "node:22-bookworm"
+base_image = "node:24-trixie"
 packages = ["ripgrep"]
 
 [git]
@@ -2640,7 +2640,7 @@ user_email = "child@example.com"
         assert_eq!(prepared.images.len(), 2);
         let parent = &prepared.images[0];
         let child = &prepared.images[1];
-        assert!(parent.dockerfile.contains("FROM node:22-bookworm"));
+        assert!(parent.dockerfile.contains("FROM node:24-trixie"));
         assert!(parent.dockerfile.contains("ripgrep"));
         assert!(parent.dockerfile.contains(DEFAULT_PI_INSTALL));
         assert!(
